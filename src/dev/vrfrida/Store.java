@@ -52,7 +52,23 @@ final class Store {
 
     static String repo(Context c) { return Settings.prefs(c).getString("storeRepo", BuildInfo.STORE_REPO).trim(); }
     static String uploadUrl() { return BuildInfo.STORE_UPLOAD; }
-    String base() { return "https://raw.githubusercontent.com/" + repo(ctx) + "/main/"; }
+    volatile String ref = "main";         // commit the loaded index came from: files are fetched from the same one
+
+    String base() { return "https://raw.githubusercontent.com/" + repo(ctx) + "/" + ref + "/"; }
+
+    /** latest commit of main. raw.githubusercontent.com caches /main/ for ~5 min (query strings don't bust it), a commit url never goes stale */
+    String latestCommit() {
+        try {
+            HttpURLConnection c = Updater.open("https://api.github.com/repos/" + repo(ctx) + "/commits/main");
+            c.setRequestProperty("Accept", "application/vnd.github.sha");
+            c.setUseCaches(false);
+            if (c.getResponseCode() != 200) return "main";
+            try (InputStream in = c.getInputStream()) {
+                String sha = new String(Files.readAll(in), "UTF-8").trim();
+                return sha.matches("[0-9a-f]{40}") ? sha : "main";
+            }
+        } catch (Exception e) { return "main"; }   // rate limited / offline: the cached branch is still fine
+    }
 
     // ---------------------------------------------------------------- installed.json
     synchronized void loadInstalled() {
@@ -112,8 +128,9 @@ final class Store {
     /** background thread. also refreshes the scan rules */
     List<Plugin> refresh() {
         try {
-            String t = "?t=" + (System.currentTimeMillis() / 60000);   // one cache-bust per minute
-            JSONObject o = new JSONObject(new String(get(base() + "index.json" + t, 2 * 1024 * 1024), "UTF-8"));
+            String at = latestCommit();
+            String t = at.equals("main") ? "?t=" + (System.currentTimeMillis() / 60000) : "";
+            JSONObject o = new JSONObject(new String(get("https://raw.githubusercontent.com/" + repo(ctx) + "/" + at + "/index.json" + t, 2 * 1024 * 1024), "UTF-8"));
             List<Plugin> out = new ArrayList<>();
             JSONArray a = o.getJSONArray("plugins");
             for (int i = 0; i < a.length(); i++) {
@@ -139,6 +156,7 @@ final class Store {
                 if (s != null) { p.high = s.optInt("high"); p.medium = s.optInt("medium"); p.low = s.optInt("low"); }
                 out.add(p);
             }
+            ref = at;
             try { Files.write(new File(Paths.STORE, "scan_rules.json"), get(base() + "scan_rules.json" + t, 512 * 1024)); } catch (Exception ignored) {}
             index = out; indexAt = System.currentTimeMillis(); error = "";
             return out;
