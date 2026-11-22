@@ -1,0 +1,8 @@
+# build output + downloaded frida binaries (build.sh fetches them)
+build/
+dl/
+*.apk
+*.idsig
+# signing keys: NEVER commit
+*.keystore
+patchkey/
