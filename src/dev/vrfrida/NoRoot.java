@@ -92,8 +92,9 @@ final class NoRoot {
     String buildAgent(Core core, ApplicationInfo ai, Settings cfg) throws Exception {
         String pkg = ai.packageName;
         File bridge = Bridge.ensure(act, ai, false, log);
-        String menu = Paths.MENU.isFile() ? new String(Files.read(Paths.MENU), StandardCharsets.UTF_8) : Files.readAsset(act, "menu.js");
-        log.log("menu: " + (Paths.MENU.isFile() ? Paths.MENU.getPath() : "the copy bundled in the app"));
+        boolean sd = Core.useSdcardMenu(act);
+        String menu = sd ? new String(Files.read(Paths.MENU), StandardCharsets.UTF_8) : Files.readAsset(act, "menu.js");
+        log.log("menu: " + (sd ? Paths.MENU.getPath() : "the copy bundled in the app"));
         List<File> plugins = Core.pluginsFor(pkg, log, cfg.disabledPlugins);
         StringBuilder sb = new StringBuilder(1 << 20);
         sb.append("// vrfrida gadget agent for ").append(pkg).append(" (no root)\n");
@@ -113,12 +114,36 @@ final class NoRoot {
         String agent = sb.toString();
         try { Files.write(gadgetAgentFile(pkg), agent.getBytes(StandardCharsets.UTF_8)); }
         catch (Exception e) { log.log("couldn't write " + gadgetAgentFile(pkg) + ": " + e); }
+        writeObbAgent(pkg, agent);
         return agent;
+    }
+
+    /** Android/obb/<pkg>/vrfrida_agent.js: vrfrida may write it (installer access), the game can always read it */
+    /** the patched game's own log: loader + menu console output (games patched with this version or newer) */
+    static File obbGameLog(String pkg) { return new File("/storage/emulated/0/Android/obb/" + pkg + "/vrfrida-game.log"); }
+
+    static File obbAgentFile(String pkg) { return new File("/storage/emulated/0/Android/obb/" + pkg + "/vrfrida_agent.js"); }
+
+    /** true if the patched game will pick it up next start. A copy we can't refresh is deleted so it can't shadow the apk's */
+    boolean writeObbAgent(String pkg, String agent) {
+        File f = obbAgentFile(pkg);
+        try {
+            File dir = f.getParentFile();
+            boolean made = !dir.exists();
+            dir.mkdirs();
+            if (made) { dir.setReadable(true, false); dir.setExecutable(true, false); }
+            Files.write(f, agent.getBytes(StandardCharsets.UTF_8));
+            f.setReadable(true, false);
+            return true;
+        } catch (Exception e) {
+            f.delete();
+            return false;
+        }
     }
 
     /**
      * Gadget runs this as soon as libmain.so loads, long before Unity sets up il2cpp.
-     * Agent order: the PC kit's files/frida/menu.js (patch_apk.py --push-only), /sdcard/vrfrida/agents/<pkg>.gadget.js
+     * Agent order: the PC kit's files/frida/menu.js (patch_apk.py --push-only), Android/obb/<pkg>/vrfrida_agent.js (Update mods, no root), /sdcard/vrfrida/agents/<pkg>.gadget.js
      * (only readable if the game has storage access), then the copy inside the apk.
      */
     static String loader(String pkg, int delay) {
@@ -129,19 +154,28 @@ final class NoRoot {
                 "  var PKG = " + q + ", DELAY = " + Math.max(0, delay) + ";\n" +
                 // Frida cloaks its own module (findModuleByName(gadget) is always null), so take the folder from the game's
                 // own libs: they sit in the same lib dir as libfrida-gadget.so and libvrfrida-agent.js.so
-                // Gadget's console goes nowhere on Quest: the loader keeps its own log in the game's files folder
-                "  var LOG = '/storage/emulated/0/Android/data/' + PKG + '/files/vrfrida-loader.log', lines = [];\n" +
-                "  function log(m) { lines.push(new Date().toISOString() + '  ' + m); if (lines.length > 200) lines.shift(); try { File.writeAllText(LOG, lines.join('\\n') + '\\n'); } catch (e) {} try { console.log('[vrfrida] ' + m); } catch (e) {} }\n" +
+                // Gadget's console goes nowhere on Quest: the loader keeps its own log, plus everything the menu / bridge
+                // print (console.* is wrapped), in the game's files folder and in its obb folder (vrfrida reads that one
+                // without root, Info / Logcat tab). Written at most once a second
+                "  var LOGS = ['/storage/emulated/0/Android/data/' + PKG + '/files/vrfrida-loader.log', '/storage/emulated/0/Android/obb/' + PKG + '/vrfrida-game.log'], lines = [], pending = false;\n" +
+                "  function flush() { pending = false; var t = lines.join('\\n') + '\\n'; for (var i = 0; i < LOGS.length; i++) { try { File.writeAllText(LOGS[i], t); } catch (e) {} } }\n" +
+                "  function push(m) { lines.push(new Date().toISOString().substr(11, 12) + '  ' + m); if (lines.length > 800) lines.shift(); if (!pending) { pending = true; setTimeout(flush, 1000); } }\n" +
+                "  function log(m) { push('[loader] ' + m); }\n" +
+                "  ['log', 'warn', 'error'].forEach(function (k) {\n" +
+                "    var orig = console[k];\n" +
+                "    console[k] = function () { var a = []; for (var i = 0; i < arguments.length; i++) a.push(String(arguments[i])); push((k === 'log' ? '' : k.toUpperCase() + ' ') + a.join(' ')); try { orig.apply(console, arguments); } catch (e) {} };\n" +
+                "  });\n" +
                 "  log('loader started (frida ' + Frida.version + ', ' + Script.runtime + ')');\n" +
                 "  function libDir() {\n" +
                 "    var m = Process.findModuleByName('libmain.so') || Process.findModuleByName('libil2cpp.so') || Process.findModuleByName('" + GADGET + "');\n" +
                 "    return m ? m.path.replace(/\\/[^\\/]*$/, '') : '';\n" +
                 "  }\n" +
                 "  var paths = ['/storage/emulated/0/Android/data/' + PKG + '/files/frida/menu.js',\n" +
+                "               '/storage/emulated/0/Android/obb/' + PKG + '/vrfrida_agent.js',\n" +
                 "               '/storage/emulated/0/vrfrida/agents/' + PKG + '.gadget.js',\n" +
                 "               null];\n" +
                 "  function load() {\n" +
-                "    paths[2] = libDir() + '/libvrfrida-agent.js.so';\n" +
+                "    paths[3] = libDir() + '/libvrfrida-agent.js.so';\n" +
                 "    for (var i = 0; i < paths.length; i++) {\n" +
                 "      var src = null;\n" +
                 "      try { src = File.readAllText(paths[i]); } catch (e) { continue; }\n" +
@@ -171,8 +205,11 @@ final class NoRoot {
         if (!isPatched(ai))
             throw new Exception("this game isn't patched yet (Patch + install never finished, check the log above for why). Update mods only works on a patched game: press Patch + install first");
         buildAgent(core, ai, cfg);
-        log.log("wrote " + gadgetAgentFile(ai.packageName));
-        log.log("the patched game loads it next start IF it can read /sdcard. If the menu doesn't change, use Patch + install again (installs as an update, keeps your game data)");
+        String pkg = ai.packageName;
+        if (obbAgentFile(pkg).isFile())
+            log.log("wrote " + obbAgentFile(pkg) + ": the game loads it next start (games patched before this version need one more Patch + install first)");
+        else
+            log.log("couldn't write into Android/obb (allow \"Install unknown apps\" for vrfrida, then fully close + reopen it). Wrote " + gadgetAgentFile(pkg) + ", which the game only reads if it has storage access; otherwise use Patch + install (keeps your game data)");
     }
 
     // ---------------------------------------------------------------- patch
@@ -341,6 +378,18 @@ final class NoRoot {
         return true;
     }
 
+    /** the game wants RECORD_AUDIO but doesn't have it (true right after the uninstall + install) */
+    boolean needsMicAgain(String pkg) {
+        try {
+            PackageInfo pi = act.getPackageManager().getPackageInfo(pkg, PackageManager.GET_PERMISSIONS);
+            if (pi.requestedPermissions == null) return false;
+            for (String p : pi.requestedPermissions)
+                if (android.Manifest.permission.RECORD_AUDIO.equals(p))
+                    return act.getPackageManager().checkPermission(p, pkg) != PackageManager.PERMISSION_GRANTED;
+        } catch (Exception ignored) {}
+        return false;
+    }
+
     void restoreObb(String pkg) {
         if (obbKept == null) return;
         File obb = new File(Environment.getExternalStorageDirectory(), "Android/obb/" + pkg);
@@ -393,6 +442,9 @@ final class NoRoot {
                 }
                 if (st == PackageInstaller.STATUS_SUCCESS) {
                     log.log("installed the patched " + pkg + ". Start it from your library: the menu loads after the game boots + the delay (hold Y)");
+                    // a fresh install (store copy uninstalled first) starts with no runtime permissions: voice chat needs the mic back
+                    if (needsMicAgain(pkg))
+                        log.log("the reinstall reset the game's permissions: allow the Microphone when the game asks, or voice chat stays silent (Quest Settings > Privacy & Safety > App permissions > Microphone)");
                     for (File f : new File[]{new File(act.getExternalFilesDir("patched"), pkg)}) deleteTree(f);
                 } else {
                     String msg = i.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);

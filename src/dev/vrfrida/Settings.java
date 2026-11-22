@@ -12,6 +12,7 @@ final class Settings {
 
     int delay = DEFAULT_DELAY;
     boolean v8 = true, sounds = true, patterns = true, authSpoof = true;
+    boolean logcatOnLaunch = true, logcatWarn = false;   // Logcat tab (global)
     boolean followGlobal = true;                 // this game gets the synced (all games) menu look on every launch
     Set<String> disabledPlugins = new HashSet<>();
 
@@ -26,6 +27,8 @@ final class Settings {
         s.patterns = p.getBoolean("patterns", true);
         s.authSpoof = p.getBoolean("authSpoof", true);
         s.followGlobal = p.getBoolean("followGlobal:" + pkg, true);
+        s.logcatOnLaunch = p.getBoolean("logcatOnLaunch", true);
+        s.logcatWarn = p.getBoolean("logcatWarn", false);
         s.disabledPlugins = new HashSet<>(p.getStringSet("plugoff:" + pkg, new HashSet<>()));
         return s;
     }
@@ -33,6 +36,7 @@ final class Settings {
     void save(Context c, String pkg) {
         prefs(c).edit().putInt("delay:" + pkg, delay).putInt("delay", delay)
                 .putBoolean("v8", v8).putBoolean("sounds", sounds).putBoolean("patterns", patterns).putBoolean("authSpoof", authSpoof)
+                .putBoolean("logcatOnLaunch", logcatOnLaunch).putBoolean("logcatWarn", logcatWarn)
                 .putBoolean("followGlobal:" + pkg, followGlobal)
                 .putStringSet("plugoff:" + pkg, new HashSet<>(disabledPlugins)).apply();
     }

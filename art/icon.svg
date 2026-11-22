@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="75%">
+      <stop offset="0" stop-color="#3a2621"/>
+      <stop offset="1" stop-color="#140e0c"/>
+    </radialGradient>
+    <radialGradient id="planet" cx="38%" cy="32%" r="75%">
+      <stop offset="0" stop-color="#f6d9cc"/>
+      <stop offset="0.55" stop-color="#e7beae"/>
+      <stop offset="1" stop-color="#9c6f62"/>
+    </radialGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff9f7a"/>
+      <stop offset="0.5" stop-color="#ffb598"/>
+      <stop offset="1" stop-color="#ff9f7a"/>
+    </linearGradient>
+    <clipPath id="front"><rect x="-300" y="0" width="600" height="300"/></clipPath>
+    <path id="spark" d="M0,-1 C0.12,-0.12 0.12,-0.12 1,0 C0.12,0.12 0.12,0.12 0,1 C-0.12,0.12 -0.12,0.12 -1,0 C-0.12,-0.12 -0.12,-0.12 0,-1Z"/>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- stars -->
+  <g fill="#d3c78e">
+    <use href="#spark" transform="translate(112 118) scale(22)"/>
+    <use href="#spark" transform="translate(404 390) scale(16)"/>
+    <use href="#spark" transform="translate(398 104) scale(11)"/>
+    <circle cx="92" cy="424" r="6"/>
+    <circle cx="452" cy="176" r="5"/>
+    <circle cx="176" cy="430" r="4.5"/>
+    <circle cx="300" cy="64" r="4"/>
+  </g>
+  <g transform="translate(256 262) rotate(-16)">
+    <!-- back half of the ring -->
+    <ellipse rx="214" ry="58" fill="none" stroke="url(#ring)" stroke-width="20" opacity="0.75"/>
+    <!-- planet -->
+    <circle r="122" fill="url(#planet)" transform="rotate(16)"/>
+    <ellipse rx="108" ry="22" cy="-38" fill="#ffffff" opacity="0.10"/>
+    <ellipse rx="116" ry="18" cy="30" fill="#7d554a" opacity="0.18"/>
+    <!-- front half of the ring, over the planet -->
+    <ellipse rx="214" ry="58" fill="none" stroke="url(#ring)" stroke-width="20" clip-path="url(#front)"/>
+  </g>
+</svg>

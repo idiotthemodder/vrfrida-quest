@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     package="dev.vrfrida"
     android:versionCode="1"
     android:versionName="1.0">
@@ -14,6 +15,8 @@
     <!-- no-root mode: install the Frida Gadget patched game, uninstall the store copy first -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+    <!-- Logcat tab without root: only works after "adb shell pm grant dev.vrfrida android.permission.READ_LOGS" -->
+    <uses-permission android:name="android.permission.READ_LOGS" tools:ignore="ProtectedPermissions" />
 
     <application
         android:label="vrfrida"
@@ -25,6 +28,8 @@
             android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden|density|screenLayout"
             android:launchMode="singleTask">
+            <!-- Horizon OS opens 2D panels at this size (the default panel is ~1024x640dp) -->
+            <layout android:defaultWidth="1480dp" android:defaultHeight="920dp" android:gravity="center" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

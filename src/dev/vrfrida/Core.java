@@ -49,7 +49,7 @@ final class Core {
                 log.log("couldn't unpack " + pair[0] + ": " + e);
             }
         }
-        for (File d : new File[]{Paths.BRIDGES, Paths.AGENTS, Paths.LOGS, Paths.RUN, Paths.SOUND_CACHE}) d.mkdirs();
+        for (File d : new File[]{Paths.BRIDGES, Paths.AGENTS, Paths.LOGS, Paths.RUN, Paths.SOUND_CACHE, Paths.LIBS}) d.mkdirs();
     }
 
     // ---- plugins (vrfrida.py plugins_for) ----
@@ -156,11 +156,120 @@ final class Core {
         if (nPatterns >= 0) log.log("patterns: " + nPatterns);
     }
 
+    /** some plugin for this game reads __RASP_SOUNDBOARD (same test syncGameFiles uses) */
+    static boolean wantsSounds(String pkg) {
+        for (File p : pluginsFor(pkg, null, null)) if (Files.head(p, 400).contains("__RASP_SOUNDBOARD")) return true;
+        return false;
+    }
+
+    static void deleteTree(File f) {
+        File[] k = f.listFiles();
+        if (k != null) for (File c : k) deleteTree(c);
+        f.delete();
+    }
+
+    static File obbSounds(String pkg) { return new File("/storage/emulated/0/Android/obb/" + pkg + "/vrfrida_sounds"); }
+
+    /** copy wavs into dir with plain file access, drop .wav files that aren't in the list. throws if dir isn't writable */
+    static int copyInto(List<File> wavs, File dir) throws Exception {
+        File parent = dir.getParentFile();
+        boolean madeParent = parent != null && !parent.exists();
+        dir.mkdirs();
+        if (!dir.isDirectory()) throw new Exception("can't create " + dir);
+        // written by vrfrida's uid, read by the game's: open the folder (and the game folder if we made it) to everyone
+        for (File d : madeParent ? new File[]{parent, dir} : new File[]{dir}) { d.setReadable(true, false); d.setExecutable(true, false); }
+        java.util.Set<String> keep = new java.util.HashSet<>();
+        int changed = 0;
+        for (File w : wavs) {
+            keep.add(w.getName());
+            File to = new File(dir, w.getName());
+            if (to.isFile() && to.length() == w.length() && to.lastModified() >= w.lastModified()) continue;
+            Files.write(to, Files.read(w));
+            to.setReadable(true, false);
+            changed++;
+        }
+        File[] old = dir.listFiles();
+        if (old != null) for (File f : old) if (f.getName().toLowerCase().endsWith(".wav") && !keep.contains(f.getName())) f.delete();
+        return changed;
+    }
+
+    /**
+     * convert the sound folder and put it where every listed game's menu reads it, one game at a time (Sounds.prepare
+     * prunes the shared cache per game).
+     *   no root: Android/obb/<game>/vrfrida_sounds. Installer apps (Install unknown apps allowed) may write a game's
+     *            obb folder, and the game can always read its own, patched (Frida Gadget) or not
+     *   root:    also files/imgui_plugins/sounds, for menus that only look there (older menu builds)
+     */
+    void pushSoundsToAll(List<String> pkgs, boolean root) {
+        int done = 0, failed = 0;
+        String why = null;
+        int cleaned = 0;
+        List<String> without = new ArrayList<>();
+        for (String pkg : pkgs) {
+            // only games with a soundboard plugin can play them: a full song library copied into every game's folder
+            // ate gigabytes per game. Copies left in other games from earlier versions are removed
+            if (!wantsSounds(pkg)) {
+                File old = obbSounds(pkg);
+                if (old.isDirectory()) { deleteTree(old); if (!old.exists()) cleaned++; }
+                without.add(pkg);
+                continue;
+            }
+            List<File> wavs = Sounds.prepare(pkg, log);
+            boolean ok = false;
+            try { copyInto(wavs, obbSounds(pkg)); ok = true; }
+            catch (Exception e) { if (why == null) why = e.getMessage(); }
+            if (root) {
+                String files = "/sdcard/Android/data/" + pkg + "/files";
+                // games that never ran have no files folder: a root-made Android/data folder could get the wrong owner
+                if (Root.sh("[ -d " + Root.q(files) + " ] && echo yes").out.trim().equals("yes")) {
+                    StringBuilder sh = new StringBuilder();
+                    copyLines(sh, wavs, Paths.gameFiles(pkg) + "/sounds", new String[]{".wav"});
+                    if (Root.sh(sh.toString()).ok()) ok = true;
+                }
+            }
+            if (ok) { done++; log.log("  " + pkg + ": " + wavs.size() + " sound(s)"); } else failed++;
+        }
+        log.log("sounds pushed to " + done + " game(s) with a soundboard plugin. Press Reload Sounds in the soundboard if a menu is already open");
+        if (!without.isEmpty()) log.log(without.size() + " game(s) skipped, no soundboard plugin for them" + (cleaned > 0 ? " (removed old sound copies from " + cleaned + " of them)" : ""));
+        if (failed > 0) log.log(failed + " game(s) failed (" + why + "). Without root vrfrida writes into Android/obb: allow \"Install unknown apps\" for vrfrida, then fully close and reopen vrfrida (Android only gives that access on a fresh start) and press Push to all games");
+    }
+
+    /** copy a picked audio file into the shared sounds folder (every game gets it). returns the saved file */
+    File importSound(android.net.Uri uri, String name) throws Exception {
+        if (name == null || name.isEmpty()) name = "sound.mp3";
+        name = name.replaceAll("[/\\\\]", "_");
+        if (!Sounds.isAudio(name)) throw new Exception(name + " isn't an audio file (" + String.join(" ", Sounds.EXT) + ")");
+        Paths.SOUNDS.mkdirs();
+        File dst = new File(Paths.SOUNDS, name);
+        int dot = name.lastIndexOf('.');
+        for (int n = 2; dst.exists(); n++) dst = new File(Paths.SOUNDS, name.substring(0, dot) + "_" + n + name.substring(dot));
+        try (java.io.InputStream in = ctx.getContentResolver().openInputStream(uri);
+             java.io.OutputStream out = new java.io.FileOutputStream(dst)) {
+            if (in == null) throw new Exception("couldn't open the file");
+            byte[] buf = new byte[1 << 16]; int n; long total = 0;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+                if ((total += n) > 200L << 20) throw new Exception("over 200 MB, too big for a sound");
+            }
+        } catch (Exception e) { dst.delete(); throw e; }
+        return dst;
+    }
+
+    /**
+     * /sdcard/vrfrida/menu.js (release download / vrfrida.py --sync) only when it is newer than this app's install:
+     * an old release's menu.js used to beat the newer menu inside an app that was sideloaded later
+     */
+    static boolean useSdcardMenu(android.content.Context c) {
+        if (!Paths.MENU.isFile()) return false;
+        try { return Paths.MENU.lastModified() > c.getPackageManager().getPackageInfo(c.getPackageName(), 0).lastUpdateTime; }
+        catch (Exception e) { return true; }
+    }
+
     /** bridge + menu in one file for frida-inject (same thing frida's repl does with two -l scripts) */
     File buildAgent(String pkg, File bridge) throws Exception {
         String menu;
         String from;
-        if (Paths.MENU.isFile()) { menu = new String(Files.read(Paths.MENU), StandardCharsets.UTF_8); from = Paths.MENU.getPath(); }
+        if (useSdcardMenu(ctx)) { menu = new String(Files.read(Paths.MENU), StandardCharsets.UTF_8); from = Paths.MENU.getPath(); }
         else { menu = Files.readAsset(ctx, "menu.js"); from = "the copy bundled in the app"; }
         log.log("menu: " + from);
         String b = new String(Files.read(bridge), StandardCharsets.UTF_8);
@@ -272,6 +381,141 @@ final class Core {
         if (say) log.log(r.out.contains("stopped") ? "stopped the injector, the menu is unloaded" : "no injector was running for " + pkg);
     }
 
+    // ---- native libs (.so, e.g. ByNameModding mods), root only ---------------------------------------------
+    // /sdcard/vrfrida/libs/<pkg>/*.so get loaded into <pkg> every time it starts, wherever it was started from
+    // (this app, the Quest Library, ...). A detached root watcher sees each new game pid, copies the libs to
+    // /data/local/tmp (an app can't dlopen from /sdcard) and runs frida-inject -e with a Module.load agent.
+    static final String LIB_TMP = "/data/local/tmp/vrfrida_libs";
+    static File libsDir(String pkg) { return new File(Paths.LIBS, pkg); }
+    static File libsPidFile() { return new File(Paths.RUN, "libs.pid"); }
+    static File libsLog() { return new File(Paths.LOGS, "libs.log"); }
+    static File libsLoaderJs() { return new File(Paths.RUN, "libs_loader.js"); }
+
+    /**
+     * the agent body (the watcher puts "var L=[paths]" in front). Does what System.loadLibrary does: dlopen, then
+     * JNI_OnLoad(vm) on a thread attached to the game's JavaVM. ByNameModding libs start in JNI_OnLoad,
+     * so without that they load but never run.
+     */
+    static final String LOADER_JS =
+            "function getVm(){\n" +
+            "  var f=Module.findGlobalExportByName('JNI_GetCreatedJavaVMs');\n" +
+            "  if(!f) return null;\n" +
+            "  var buf=Memory.alloc(8), n=Memory.alloc(4);\n" +
+            "  var r=new NativeFunction(f,'int',['pointer','int','pointer'])(buf,1,n);\n" +
+            "  return (r===0 && n.readS32()>0) ? buf.readPointer() : null;\n" +
+            "}\n" +
+            "L.forEach(function(p){\n" +
+            "  var m;\n" +
+            "  try{ m=Module.load(p); console.log('[libs] loaded '+p); }\n" +
+            "  catch(e){ console.log('[libs] FAILED '+p+': '+e); return; }\n" +
+            "  var il=Process.findModuleByName('libil2cpp.so');\n" +
+            "  console.log('[libs] libil2cpp.so '+(il?'already loaded':'not loaded yet'));\n" +
+            // ByNameModding: if the game's il2cpp_init already ran, BNM only starts with its late-init hook on
+            "  var late=m.findExportByName('_ZN3BNM7Loading17AllowLateInitHookEv');\n" +
+            "  if(late){ try{ new NativeFunction(late,'void',[])(); console.log('[libs] BNM late init hook allowed'); }catch(e){ console.log('[libs] AllowLateInitHook failed: '+e); } }\n" +
+            "  var onload=m.findExportByName('JNI_OnLoad');\n" +
+            "  if(!onload) return;\n" +
+            "  var vm=getVm();\n" +
+            "  if(!vm){ console.log('[libs] no JavaVM found, JNI_OnLoad not called'); return; }\n" +
+            "  var fns=vm.readPointer();\n" +   // JNIInvokeInterface: [4] AttachCurrentThread, [5] DetachCurrentThread
+            "  var attach=new NativeFunction(fns.add(4*Process.pointerSize).readPointer(),'int',['pointer','pointer','pointer']);\n" +
+            "  var detach=new NativeFunction(fns.add(5*Process.pointerSize).readPointer(),'int',['pointer']);\n" +
+            "  var envp=Memory.alloc(Process.pointerSize);\n" +
+            "  if(attach(vm,envp,NULL)!==0){ console.log('[libs] AttachCurrentThread failed, JNI_OnLoad not called'); return; }\n" +
+            "  try{ var v=new NativeFunction(onload,'int',['pointer','pointer'])(vm,NULL); console.log('[libs] JNI_OnLoad -> 0x'+(v>>>0).toString(16)); }\n" +
+            "  catch(e){ console.log('[libs] JNI_OnLoad crashed: '+e); }\n" +
+            "  detach(vm);\n" +
+            "});\n";
+
+    static List<File> libs(String pkg) {
+        List<File> out = new ArrayList<>();
+        File[] fs = libsDir(pkg).listFiles((d, n) -> n.endsWith(".so"));
+        if (fs != null) { java.util.Arrays.sort(fs); for (File f : fs) if (f.isFile()) out.add(f); }
+        return out;
+    }
+
+    static boolean anyLibs() {
+        File[] ds = Paths.LIBS.listFiles(File::isDirectory);
+        if (ds != null) for (File d : ds) if (!libs(d.getName()).isEmpty()) return true;
+        return false;
+    }
+
+    /** copy a picked .so into libs/<pkg>/, refusing anything that isn't a 64-bit ARM ELF (the game is arm64) */
+    File importLib(String pkg, android.net.Uri uri, String name) throws Exception {
+        byte[] data;
+        try (java.io.InputStream in = ctx.getContentResolver().openInputStream(uri)) {
+            if (in == null) throw new Exception("couldn't open the file");
+            java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[1 << 16]; int n;
+            while ((n = in.read(buf)) > 0) { b.write(buf, 0, n); if (b.size() > 512L << 20) throw new Exception("over 512 MB, that's not a mod lib"); }
+            data = b.toByteArray();
+        }
+        if (data.length < 64 || data[0] != 0x7f || data[1] != 'E' || data[2] != 'L' || data[3] != 'F') throw new Exception("not an ELF .so file");
+        int machine = (data[18] & 0xff) | (data[19] & 0xff) << 8;
+        if (data[4] != 2 || machine != 183) throw new Exception("not a 64-bit ARM (arm64-v8a) library, the game can't load it");
+        if (name == null || name.isEmpty()) name = "lib.so";
+        name = name.replaceAll("[^A-Za-z0-9._-]", "_");
+        if (!name.endsWith(".so")) name += ".so";
+        File dir = libsDir(pkg);
+        dir.mkdirs();
+        File dst = new File(dir, name);
+        Files.write(dst, data);
+        return dst;
+    }
+
+    boolean libWatcherRunning() {
+        Root.Result r = Root.sh("p=$(cat " + Root.q(libsPidFile().getPath()) + " 2>/dev/null); [ -n \"$p\" ] && kill -0 $p 2>/dev/null && echo yes");
+        return r.out.trim().equals("yes");
+    }
+
+    /** (re)start the watcher if any game has libs, stop it if none do. Restarted on every app start: the injector path changes with app updates */
+    void syncLibWatcher() {
+        stopLibWatcher();
+        if (!anyLibs()) return;
+        try { Files.write(libsLoaderJs(), LOADER_JS.getBytes(StandardCharsets.UTF_8)); }
+        catch (Exception e) { log.log("couldn't write " + libsLoaderJs() + ": " + e); return; }
+        String inj = Root.q(injector());
+        String script =
+                "LOG=" + Root.q(libsLog().getPath()) + "\n" +
+                "T=" + LIB_TMP + "\n" +
+                "echo $$ > " + Root.q(libsPidFile().getPath()) + "\n" +
+                "mkdir -p $T; chmod 755 $T\n" +   // keep <pkg>.last: a game already running with its libs must not get them twice
+                "echo \"[libs] $(date '+%H:%M:%S') watcher started\" > \"$LOG\"\n" +
+                "while kill -0 $$ 2>/dev/null; do\n" +
+                "  for d in " + Paths.LIBS.getPath() + "/*; do\n" +
+                "    [ -d \"$d\" ] || continue\n" +
+                "    pkg=${d##*/}\n" +
+                "    ls \"$d\"/*.so >/dev/null 2>&1 || continue\n" +
+                "    pid=$(pidof \"$pkg\" 2>/dev/null | cut -d' ' -f1)\n" +
+                "    if [ -z \"$pid\" ]; then rm -f \"$T/$pkg.last\"; continue; fi\n" +
+                "    [ \"$(cat \"$T/$pkg.last\" 2>/dev/null)\" = \"$pid\" ] && continue\n" +
+                "    echo \"$pid\" > \"$T/$pkg.last\"\n" +
+                "    sleep 1\n" +                                    // let the fresh process finish starting up
+                "    D=\"$T/$pkg/$pid\"; rm -rf \"$T/$pkg\"; mkdir -p \"$D\"\n" +   // per-pid folder: never a 2nd copy of a lib already loaded
+                "    cp \"$d\"/*.so \"$D\"/; chmod 755 \"$T/$pkg\" \"$D\"; chmod 644 \"$D\"/*.so\n" +
+                "    chcon -R u:object_r:system_lib_file:s0 \"$T/$pkg\" 2>/dev/null\n" +
+                "    JS=\"$D/load.js\"\n" +
+                "    echo 'var L=[' > \"$JS\"\n" +
+                "    for f in \"$D\"/*.so; do echo \"'$f',\" >> \"$JS\"; done\n" +
+                "    echo '];' >> \"$JS\"; cat " + Root.q(libsLoaderJs().getPath()) + " >> \"$JS\"\n" +
+                "    echo \"[libs] $(date '+%H:%M:%S') $pkg started (pid $pid), loading $(ls \"$D\"/*.so | wc -l) lib(s)\" >> \"$LOG\"\n" +
+                "    " + inj + " -p $pid -s \"$JS\" -R qjs -e < /dev/null >> \"$LOG\" 2>&1\n" +
+                "    echo \"[libs] $(date '+%H:%M:%S') frida-inject exited ($?)\" >> \"$LOG\"\n" +
+                "  done\n" +
+                "  sleep 1\n" +
+                "done\n";
+        File f = new File(Paths.RUN, "libs.sh");
+        try { Files.write(f, script.getBytes(StandardCharsets.UTF_8)); }
+        catch (Exception e) { log.log("couldn't write " + f + ": " + e); return; }
+        Root.sh("chmod 755 " + inj + " 2>/dev/null; setsid sh " + Root.q(f.getPath()) + " < /dev/null > /dev/null 2>&1 &");
+    }
+
+    void stopLibWatcher() {
+        String pf = Root.q(libsPidFile().getPath());
+        Root.sh("p=$(cat " + pf + " 2>/dev/null)\n" +
+                "if [ -n \"$p\" ] && kill -0 $p 2>/dev/null; then pkill -P $p; kill $p; fi; rm -f " + pf);
+    }
+
     // ---- appsafety root-detection spoof (same hooks as ~/thing.sh) --------------------------------------
     // Injected into com.oculus.appsafety (NOT the game), eternalized so it stays after frida-inject detaches,
     // so games that check device integrity at startup still authenticate on a rooted headset.
@@ -348,10 +592,28 @@ final class Core {
         return r.out.contains("ok");
     }
 
-    void launch(String pkg) throws Exception {
+    /** normal launch intent; if that fails (or the game never shows up) and we have root, monkey as a fallback */
+    void launch(String pkg, boolean root) throws Exception {
+        Exception err = null;
         Intent i = ctx.getPackageManager().getLaunchIntentForPackage(pkg);
-        if (i == null) throw new Exception(pkg + " has no launcher activity");
-        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        ctx.startActivity(i);
+        if (i == null) {
+            // Quest games often only have an INFO / VR category, not LAUNCHER
+            Intent q = new Intent(Intent.ACTION_MAIN).setPackage(pkg);
+            java.util.List<android.content.pm.ResolveInfo> r = ctx.getPackageManager().queryIntentActivities(q, 0);
+            if (!r.isEmpty()) i = q.setClassName(pkg, r.get(0).activityInfo.name);
+        }
+        if (i != null) {
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+            try { ctx.startActivity(i); } catch (Exception e) { err = e; }
+        } else err = new Exception(pkg + " has no launchable activity");
+        if (!root) { if (err != null) throw err; return; }
+        // give it a few seconds to appear, else force it with monkey
+        for (int t = 0; t < 8 && err == null; t++) {
+            if (!pidOf(pkg).isEmpty()) return;
+            Thread.sleep(500);
+        }
+        if (!pidOf(pkg).isEmpty()) return;
+        Root.Result m = Root.sh("monkey -p " + Root.q(pkg) + " -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 || monkey -p " + Root.q(pkg) + " 1 >/dev/null 2>&1");
+        if (!m.ok() && err != null) throw new Exception("couldn't launch " + pkg + ": " + err.getMessage());
     }
 }

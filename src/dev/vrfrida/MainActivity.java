@@ -18,6 +18,7 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
@@ -53,7 +54,7 @@ import java.util.concurrent.Executors;
 
 /** the app, drawn to look like UniversalMenu (same themes, backgrounds and widgets) */
 public class MainActivity extends Activity {
-    static final String[] TABS = {"Games", "Plugins", "Store", "Menu Look", "Log"};
+    static final String[] TABS = {"Games", "Plugins", "Store", "Menu Look", "Log", "Info", "Logcat"};
 
     static final class Game {
         ApplicationInfo ai; String label; Bitmap icon; String fp = ""; String bridge = "?"; boolean running, injected, fav, patched;
@@ -100,7 +101,7 @@ public class MainActivity extends Activity {
         String want = "";
         try { want = new String(Files.read(trig), "UTF-8").trim(); } catch (Exception ignored) {}
         trig.delete();
-        if (want.matches("[0-4]") && Integer.parseInt(want) != tab) { goTab(Integer.parseInt(want)); ui.postDelayed(() -> { try { Files.write(trig, new byte[0]); } catch (Exception ignored) {} }, 1500); return; }
+        if (want.matches("[0-6]") && Integer.parseInt(want) != tab) { goTab(Integer.parseInt(want)); ui.postDelayed(() -> { try { Files.write(trig, new byte[0]); } catch (Exception ignored) {} }, 1500); return; }
         try {
             View v = getWindow().getDecorView();
             Bitmap b = Bitmap.createBitmap(v.getWidth(), v.getHeight(), Bitmap.Config.ARGB_8888);
@@ -153,6 +154,8 @@ public class MainActivity extends Activity {
         autoCheckUpdate();
         log("checking root (accept the Magisk prompt if one shows up)");
         rootOk = Root.available();
+        if (!rootOk) { try { Thread.sleep(1500); } catch (InterruptedException ignored) {} rootOk = Root.available(); }
+        log(rootOk ? "root ok" : "root check failed");
         if (!rootOk) {
             log("no root: no-root mode. Pick a game and use Patch + install (puts Frida Gadget into the game, no root needed)");
             ui.post(this::rebuild);
@@ -170,6 +173,7 @@ public class MainActivity extends Activity {
         core.writeSpoofScript();        // appsafety spoof script on disk, ready for a launch
         look.bitmaps.clear();          // pattern pngs exist now
         if (rootOk && !new File(core.injector()).isFile()) log("frida-inject is missing from the app (" + core.injector() + "), rebuild the apk");
+        if (rootOk) core.syncLibWatcher();
         scanGames();
     }
 
@@ -392,7 +396,10 @@ public class MainActivity extends Activity {
     // ================================================================ jobs
     interface Job { void run(Game g) throws Exception; }
 
-    void job(String what, Job j) { if (rootOk) job(what, j, false); }
+    void job(String what, Job j) {
+        if (!rootOk) { log(what + " needs root (Magisk). Without root: Launch works, the menu loads in games done with Patch + install"); return; }
+        job(what, j, false);
+    }
 
     /** keepBusy: the job hands off to the install flow, which clears busy itself when it ends */
     void job(String what, Job j, boolean keepBusy) {
@@ -406,18 +413,206 @@ public class MainActivity extends Activity {
         io.execute(() -> bg.execute(() -> {
             boolean ok = false;
             try { j.run(g); ok = true; }
-            catch (Exception e) { log("error: " + e.getMessage()); }
+            catch (Throwable e) { log("error: " + e); }
             finally { if (!(ok && keepBusy)) ui.post(() -> setBusy(false)); refreshStatus(); }
         }));
     }
 
+    // ---------------------------------------------------------------- native libs (root)
+    static final int REQ_PICK_LIB = 4712;
+    String libPickPkg;
+
+    void pickLib() {
+        if (sel == null || !rootOk) return;
+        libPickPkg = sel.ai.packageName;
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*");
+        try { startActivityForResult(i, REQ_PICK_LIB); }
+        catch (Exception e) { log("no file picker on this headset: put the .so in " + Core.libsDir(libPickPkg) + " by hand"); }
+    }
+
+    void onLibPicked(int res, Intent data) {
+        String pkg = libPickPkg;
+        if (res != RESULT_OK || data == null || data.getData() == null || pkg == null) return;
+        Uri uri = data.getData();
+        io.execute(() -> {
+            String name = null;
+            try (android.database.Cursor c = getContentResolver().query(uri, new String[]{android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+                if (c != null && c.moveToFirst()) name = c.getString(0);
+            } catch (Exception ignored) {}
+            try {
+                File f = core.importLib(pkg, uri, name);
+                log("added " + f.getName() + " for " + pkg + ": it loads every time the game starts");
+                core.syncLibWatcher();
+                if (!core.pidOf(pkg).isEmpty()) log("the game is running now: restart it to load the new lib");
+            } catch (Exception e) {
+                log("couldn't add that lib: " + e.getMessage());
+            }
+            ui.post(this::rebuild);
+        });
+    }
+
+    // ---------------------------------------------------------------- sounds (every game)
+    static final int REQ_PICK_SOUNDS = 4713;
+
+    /** vrfrida has all-files access, so it lists the headset's audio itself (Quest's system picker often shows nothing) */
+    void pickSounds() {
+        io.execute(() -> {
+            List<File> found = new ArrayList<>();
+            File sd = Environment.getExternalStorageDirectory();
+            if (Environment.isExternalStorageManager()) {
+                File[] top = sd.listFiles();
+                if (top != null) for (File d : top) {
+                    String n = d.getName();
+                    // skip Android/ (other apps' data), our own folders and hidden ones
+                    if (n.startsWith(".") || n.equals("Android") || n.equals("vrfrida")) continue;
+                    if (d.isFile()) { if (Sounds.isAudio(n)) found.add(d); }
+                    else findAudio(d, 4, found);
+                }
+            }
+            found.sort((a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+            ui.post(() -> showSoundList(found, sd));
+        });
+    }
+
+    static void findAudio(File dir, int depth, List<File> out) {
+        if (depth < 0 || out.size() >= 500) return;
+        File[] fs = dir.listFiles();
+        if (fs == null) return;
+        for (File f : fs) {
+            if (f.getName().startsWith(".")) continue;
+            if (f.isDirectory()) findAudio(f, depth - 1, out);
+            else if (Sounds.isAudio(f.getName())) out.add(f);
+        }
+    }
+
+    void showSoundList(List<File> found, File sd) {
+        android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this).setTitle("Add sounds");
+        if (found.isEmpty()) {
+            b.setMessage("No audio files found on the headset (mp3 / ogg / wav / m4a / flac...).\n\nPut some in the Download or Music folder (browser download, SideQuest, USB), or look with the system file picker.")
+             .setPositiveButton("System picker", (d, w) -> systemSoundPicker())
+             .setNegativeButton("Close", null).show();
+            return;
+        }
+        String[] labels = new String[found.size()];
+        String root = sd.getPath() + "/";
+        for (int k = 0; k < labels.length; k++) {
+            File f = found.get(k);
+            labels[k] = f.getName() + "   (" + f.getParent().replace(root, "").replace(sd.getPath(), "") + ", " + Math.max(1, f.length() / 1024) + " KB)";
+        }
+        boolean[] on = new boolean[labels.length];
+        b.setMultiChoiceItems(labels, on, (d, k, v) -> on[k] = v)
+         .setPositiveButton("Add", (d, w) -> {
+             List<File> pick = new ArrayList<>();
+             for (int k = 0; k < on.length; k++) if (on[k]) pick.add(found.get(k));
+             if (pick.isEmpty()) return;
+             io.execute(() -> {
+                 int added = 0;
+                 for (File f : pick) {
+                     try { File o = core.importSound(Uri.fromFile(f), f.getName()); log("added sound " + o.getName()); added++; }
+                     catch (Exception e) { log("couldn't add " + f.getName() + ": " + e.getMessage()); }
+                 }
+                 if (added > 0) pushSoundsNow();
+                 ui.post(this::rebuild);
+             });
+         })
+         .setNeutralButton("System picker", (d, w) -> systemSoundPicker())
+         .setNegativeButton("Cancel", null).show();
+    }
+
+    /** fallback: the system picker, showing every file type (importSound checks the extension) */
+    void systemSoundPicker() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
+                .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        try { startActivityForResult(i, REQ_PICK_SOUNDS); }
+        catch (Exception e) { log("no file picker on this headset: put the sounds in " + Paths.SOUNDS + " by hand"); }
+    }
+
+    void onSoundsPicked(int res, Intent data) {
+        if (res != RESULT_OK || data == null) return;
+        List<Uri> uris = new ArrayList<>();
+        if (data.getClipData() != null) for (int k = 0; k < data.getClipData().getItemCount(); k++) uris.add(data.getClipData().getItemAt(k).getUri());
+        else if (data.getData() != null) uris.add(data.getData());
+        if (uris.isEmpty()) return;
+        io.execute(() -> {
+            int added = 0;
+            for (Uri uri : uris) {
+                String name = null;
+                try (android.database.Cursor c = getContentResolver().query(uri, new String[]{android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+                    if (c != null && c.moveToFirst()) name = c.getString(0);
+                } catch (Exception ignored) {}
+                try { File f = core.importSound(uri, name); log("added sound " + f.getName()); added++; }
+                catch (Exception e) { log("couldn't add " + (name == null ? "that file" : name) + ": " + e.getMessage()); }
+            }
+            if (added > 0) pushSoundsNow();
+            ui.post(this::rebuild);
+        });
+    }
+
+    /** io thread */
+    void pushSoundsNow() {
+        if (!rootOk && !noRoot.canInstall()) {
+            log("sounds are saved in " + Paths.SOUNDS + ". To put them in games without root, allow \"Install unknown apps\" for vrfrida (that lets it write Android/obb), reopen vrfrida, then press Push to all games");
+            ui.post(noRoot::openInstallPermission);
+            return;
+        }
+        List<String> pkgs = new ArrayList<>();
+        synchronized (games) { for (Game g : games) pkgs.add(g.ai.packageName); }
+        log("── pushing sounds to " + pkgs.size() + " game(s)");
+        core.pushSoundsToAll(pkgs, rootOk);
+    }
+
+    static int soundCount() {
+        File[] fs = Paths.SOUNDS.listFiles();
+        int n = 0;
+        if (fs != null) for (File f : fs) if (f.isFile() && Sounds.isAudio(f.getName())) n++;
+        return n;
+    }
+
+    void removeLib(File f) {
+        io.execute(() -> {
+            log(f.delete() ? "removed " + f.getName() + " (a running game keeps it until it restarts)" : "couldn't remove " + f);
+            core.syncLibWatcher();
+            ui.post(this::rebuild);
+        });
+    }
+
+    View libsBox(String pkg) {
+        LinearLayout d = vbox();
+        d.addView(section("Native libs (.so)"));
+        List<File> ls = Core.libs(pkg);
+        for (File f : ls) {
+            LinearLayout r = hbox();
+            TextView t = text(f.getName() + "   " + (f.length() / 1024) + " KB", 14, col("Text"));
+            r.addView(t, lpm(0, -2, 1, 3));
+            r.addView(dangerButton("Remove", v -> removeLib(f)), lpm(-2, -2, 0, 3));
+            d.addView(r);
+        }
+        LinearLayout r = hbox();
+        r.addView(withIcon(button("Add .so", ls.isEmpty(), v -> pickLib(), true), "upload"), lpm(0, -2, 1, 3));
+        d.addView(r);
+        TextView h = text("arm64 libs (ByNameModding etc.) loaded into the game every time it starts, also from the Quest Library. "
+                + "Log: " + Core.libsLog().getPath(), 12, col("TextDisabled"));
+        h.setPadding(0, dp(2), 0, 0);
+        d.addView(h);
+        return d;
+    }
+
     void launchAndInject() {
+        if (sel != null && cfg.logcatOnLaunch && canReadLogs()) startLogcat(sel);
+        if (!rootOk) {
+            job("launch (no root)", g -> {
+                core.launch(g.ai.packageName, false);
+                log(g.patched ? "launching " + g.label + ", it's patched so the menu loads by itself after " + cfg.delay + "s"
+                        : "launched " + g.label + " without the menu: no root, so use Patch + install below to get the menu in it");
+            }, false);
+            return;
+        }
         job("launch + inject", g -> {
             File agent = core.prepare(g.ai, cfg, false);
             if (cfg.authSpoof) { core.startSpoof(true); log("auth spoof armed (appsafety)"); }
             core.startInjector(g.ai.packageName, agent, cfg.delay, cfg.v8);
             log("launching " + g.label + ", the menu loads " + cfg.delay + "s after it opens");
-            core.launch(g.ai.packageName);
+            core.launch(g.ai.packageName, true);
         });
     }
 
@@ -461,10 +656,13 @@ public class MainActivity extends Activity {
     @Override protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
         if (noRoot != null) noRoot.onActivityResult(req);
+        if (req == REQ_PICK_LIB) onLibPicked(res, data);
+        if (req == REQ_PICK_SOUNDS) onSoundsPicked(res, data);
     }
 
     @Override protected void onDestroy() {
         if (noRoot != null) noRoot.close();
+        logcat.stop();
         if (updater != null) updater.close();
         super.onDestroy();
     }
@@ -529,6 +727,7 @@ public class MainActivity extends Activity {
 
     // ================================================================ log
     void log(String s) {
+        android.util.Log.i("vrfrida", s);
         String line = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date()) + "  " + s;
         synchronized (appLog) {
             appLog.append(line).append('\n');
@@ -895,7 +1094,7 @@ public class MainActivity extends Activity {
         tabScroll = new ScrollView(this);
         tabScroll.setFillViewport(true);
         tabScroll.setVerticalScrollBarEnabled(true);
-        View body = tab == 0 ? gamesTab() : tab == 1 ? pluginsTab() : tab == 2 ? storeTab() : tab == 3 ? lookTab() : logTab();
+        View body = tab == 0 ? gamesTab() : tab == 1 ? pluginsTab() : tab == 2 ? storeTab() : tab == 3 ? lookTab() : tab == 4 ? logTab() : tab == 5 ? infoTab() : logcatTab();
         tabScroll.addView(body);
         tabScroll.setPadding(dp(16), dp(8), dp(20), dp(16));
         tabScroll.setClipToPadding(false);
@@ -941,7 +1140,7 @@ public class MainActivity extends Activity {
         return t;
     }
 
-    static final String[] TAB_ICONS = {"games", "extension", "store", "palette", "article"};
+    static final String[] TAB_ICONS = {"games", "extension", "store", "palette", "article", "bolt", "code"};
 
     /** M3 navigation rail: icon in a pill indicator, label under it */
     View navRail() {
@@ -1142,18 +1341,18 @@ public class MainActivity extends Activity {
 
         LinearLayout r1 = hbox();
         r1.setPadding(0, dp(8), 0, 0);
-        r1.addView(withIcon(button("Launch + inject", true, v -> launchAndInject(), true), "play"), lpm(0, -2, 1.4f, 3));
-        r1.addView(withIcon(button("Inject now", false, v -> injectNow(), true), "bolt"), lpm(0, -2, 1, 3));
-        r1.addView(withIcon(dangerButton("Unload menu", v -> job("unload", g -> core.stopInjector(g.ai.packageName, true))), "stop"), lpm(0, -2, 1, 3));
+        r1.addView(withIcon(button(rootOk ? "Launch + inject" : "Launch", true, v -> launchAndInject(), true), "play"), lpm(0, -2, 1.4f, 3));
+        if (rootOk) r1.addView(withIcon(button("Inject now", false, v -> injectNow(), true), "bolt"), lpm(0, -2, 1, 3));
+        if (rootOk) r1.addView(withIcon(dangerButton("Unload menu", v -> job("unload", g -> core.stopInjector(g.ai.packageName, true))), "stop"), lpm(0, -2, 1, 3));
         d.addView(r1);
         LinearLayout r2 = hbox();
         r2.addView(button("Plugins ›", false, v -> goTab(1), false), lpm(0, -2, 1, 3));
         r2.addView(button("Menu look ›", false, v -> { lookScope = cfg.followGlobal ? 0 : 1; goTab(3); }, false), lpm(0, -2, 1, 3));
-        r2.addView(withIcon(button("Rebuild bridge", false, v -> job("rebuild bridge", g -> Bridge.ensure(this, g.ai, true, this::log)), true), "build"), lpm(0, -2, 1, 3));
+        if (rootOk) r2.addView(withIcon(button("Rebuild bridge", false, v -> job("rebuild bridge", g -> Bridge.ensure(this, g.ai, true, this::log)), true), "build"), lpm(0, -2, 1, 3));
         d.addView(r2);
 
         if (!rootOk) {
-            TextView w = text("No root: Launch + inject needs Magisk. Use No root (Frida Gadget) below instead.", 13, col("NotifWarn"));
+            TextView w = text("No root: Launch just opens the game. For the menu use Patch + install below (then Launch loads it by itself).", 13, col("NotifWarn"));
             w.setPadding(0, dp(6), 0, 0);
             d.addView(w);
         }
@@ -1172,10 +1371,20 @@ public class MainActivity extends Activity {
         String pkg = sel.ai.packageName;
         d.addView(row("Menu Delay (s)", slider(cfg.delay, 0, 120, 0, v -> { cfg.delay = (int) Math.round(v); cfg.save(this, pkg); })));
         d.addView(row("Synced look", checkbox(cfg.followGlobal, "use the All games look from the Menu Look tab", v -> { cfg.followGlobal = v; cfg.save(this, pkg); })));
-        d.addView(row("Auth spoof", checkbox(cfg.authSpoof, "spoof root in appsafety so games authenticate (needed by most)", v -> { cfg.authSpoof = v; cfg.save(this, pkg); if (!v && rootOk) io.execute(() -> core.stopSpoof(true)); })));
+        if (rootOk) d.addView(row("Auth spoof", checkbox(cfg.authSpoof, "spoof root in appsafety so games authenticate (needed by most)", v -> { cfg.authSpoof = v; cfg.save(this, pkg); if (!v && rootOk) io.execute(() -> core.stopSpoof(true)); })));
         d.addView(row("V8 Runtime", checkbox(cfg.v8, "faster than quickjs for heavy hooks", v -> { cfg.v8 = v; cfg.save(this, pkg); })));
         d.addView(row("Push Sounds", checkbox(cfg.sounds, "soundboard clips, converted on the headset", v -> { cfg.sounds = v; cfg.save(this, pkg); })));
         d.addView(row("Push Patterns", checkbox(cfg.patterns, "menu background pictures", v -> { cfg.patterns = v; cfg.save(this, pkg); })));
+
+        d.addView(section("Sounds (every game)"));
+        LinearLayout rs = hbox();
+        rs.addView(withIcon(button("Add sounds", true, v -> pickSounds(), true), "upload"), lpm(0, -2, 1, 3));
+        rs.addView(withIcon(button("Push to all games", false, v -> io.execute(this::pushSoundsNow), true), "sync"), lpm(0, -2, 1, 3));
+        d.addView(rs);
+        TextView sn = text(soundCount() + " sound(s) in " + Paths.SOUNDS + ". Pick mp3 / ogg / wav / m4a files from the headset: they're converted and copied into every game's soundboard (root or no root: without root it uses the game's Android/obb folder, so allow Install unknown apps).", 12, col("TextDisabled"));
+        sn.setPadding(0, dp(2), 0, 0);
+        d.addView(sn);
+        if (rootOk) d.addView(libsBox(pkg));
 
         d.addView(section("Log"));
         miniLog = text("", 12, col("Text"));
@@ -1643,7 +1852,8 @@ public class MainActivity extends Activity {
     View lookTab() {
         LinearLayout d = vbox();
         LinearLayout head = hbox();
-        String[] scopes = sel != null ? new String[]{"All games (synced)", sel.label + " only"} : new String[]{"All games (synced)"};
+        if (!rootOk) lookScope = 0;
+        String[] scopes = sel != null && rootOk ? new String[]{"All games (synced)", sel.label + " only"} : new String[]{"All games (synced)"};
         View sc = combo(scopes, Math.min(lookScope, scopes.length - 1), i -> { flushSave(); lookScope = i; rebuild(); });
         d.addView(row("Editing", sc));
         d.addView(menuPreview());
@@ -1653,8 +1863,8 @@ public class MainActivity extends Activity {
             h.setPadding(dp(4), dp(4), 0, dp(4));
             d.addView(h);
             LinearLayout r = hbox();
-            r.addView(button("Apply to all games now", true, v -> applyLookToAll(), true), lpm(0, -2, 1.3f, 3));
-            if (sel != null) r.addView(button("Copy from " + sel.label, false, v -> copyLookFromGame(), true), lpm(0, -2, 1, 3));
+            if (rootOk) r.addView(button("Apply to all games now", true, v -> applyLookToAll(), true), lpm(0, -2, 1.3f, 3));
+            if (sel != null && rootOk) r.addView(button("Copy from " + sel.label, false, v -> copyLookFromGame(), true), lpm(0, -2, 1, 3));
             r.addView(button("Reset", false, v -> {
                 try { globalCfg.root.put("menu", new JSONObject()); } catch (Exception ignored) {}
                 globalChanged(true);
@@ -1795,6 +2005,274 @@ public class MainActivity extends Activity {
     }
 
     // ---------------------------------------------------------------- Log tab
+    // ---------------------------------------------------------------- Info tab (questfetch + debug report)
+    // drawn like a terminal running fastfetch with the user's own config: planet logo, coloured keys, colour blocks
+    View infoTab() {
+        LinearLayout d = vbox();
+        TextView qf = terminal(d, "questfetch", 13);
+        // logo on a real character grid (Android's monospace font draws block characters wider than letters)
+        LinearLayout fetchRow = new LinearLayout(this);
+        fetchRow.setOrientation(LinearLayout.HORIZONTAL);
+        LogoView logoView = new LogoView(DeviceInfo.LOGO, 13);
+        logoView.setPadding(dp(8), dp(18), dp(28), 0);
+        fetchRow.addView(logoView, new LinearLayout.LayoutParams(-2, -2));
+        ViewGroup card = (ViewGroup) qf.getParent();
+        card.removeView(qf);
+        fetchRow.addView(qf, new LinearLayout.LayoutParams(0, -2, 1));
+        card.addView(fetchRow);
+        LinearLayout b = hbox();
+        b.addView(withIcon(button("Copy info", true, v -> copyText("vrfrida info", infoText), false), "upload"), lpm(0, -2, 1, 3));
+        b.addView(withIcon(button("Refresh", false, v -> rebuild(), false), "refresh"), lpm(0, -2, 1, 3));
+        LinearLayout.LayoutParams blp = lp(-1, -2, 0);
+        blp.setMargins(0, dp(8), 0, 0);
+        d.addView(b, blp);
+        TextView rep = terminal(d, "questfetch --debug" + (sel != null ? " " + sel.ai.packageName : ""), 12);
+        rep.setText(span("collecting...", DeviceInfo.DIM, false));
+        TextView gl = terminal(d, "tail " + (sel != null ? "Android/obb/" + sel.ai.packageName + "/vrfrida-game.log" : "vrfrida-game.log"), 12);
+        final Game g = sel;
+        io.execute(() -> {
+            int games, patched = 0;
+            synchronized (this.games) { games = this.games.size(); for (Game x : this.games) if (x.patched) patched++; }
+            long ver = updater.installedVersion();
+            List<String[]> rows = DeviceInfo.fetch(this, rootOk, games, patched, Core.allPlugins().size(), soundCount(), ver);
+            String report = DeviceInfo.report(this, rootOk, g != null ? g.ai : null, g != null ? g.fp : null, ver);
+            String glog = g == null ? "select a game on the Games tab" : readTail(NoRoot.obbGameLog(g.ai.packageName), 12000,
+                    "no game log yet. Patched games write one here once they were patched with this vrfrida version and started (it needs \"Install unknown apps\" for vrfrida to read it)");
+            ui.post(() -> {
+                qf.setText(fetchText(rows));
+                rep.setText(colorReport(report));
+                gl.setText(glog);
+                StringBuilder plain = new StringBuilder("vrfrida@" + Build.MODEL + "\n");
+                for (String[] r : rows) plain.append(r[0]).append(": ").append(r[1]).append('\n');
+                infoText = plain + "\n" + report;
+            });
+        });
+        return d;
+    }
+    String infoText = "";
+
+    /** a terminal panel: dark card, "❯ command" prompt line, monospace output. returns the output view */
+    TextView terminal(LinearLayout parent, String command, float sp) {
+        LinearLayout card = vbox();
+        card.setBackground(rr(DeviceInfo.BG, 14));
+        card.setPadding(dp(16), dp(12), dp(16), dp(14));
+        TextView prompt = text("", sp, DeviceInfo.TEXT);
+        prompt.setTypeface(Typeface.MONOSPACE);
+        android.text.SpannableStringBuilder p = new android.text.SpannableStringBuilder();
+        p.append(span("vrfrida", DeviceInfo.C3, true)).append(span(" ~ ", DeviceInfo.DIM, false)).append(span("❯ ", DeviceInfo.C1, true)).append(command);
+        prompt.setText(p);
+        card.addView(prompt);
+        TextView out = text("", sp, DeviceInfo.TEXT);
+        out.setTypeface(Typeface.MONOSPACE);
+        out.setTextIsSelectable(true);
+        out.setLineSpacing(0, 1.05f);
+        out.setPadding(0, dp(6), 0, 0);
+        card.addView(out);
+        LinearLayout.LayoutParams lp = lp(-1, -2, 0);
+        lp.setMargins(0, dp(12), 0, 0);
+        parent.addView(card, lp);
+        return out;
+    }
+
+    /** fastfetch layout: logo (padding top 1, left 1, right 3), then title, ----, "Key  value" rows, two rows of colour blocks */
+    CharSequence fetchText(List<String[]> rows) {
+        String title = "vrfrida@" + Build.MODEL.replace(' ', '_');
+        List<CharSequence> right = new ArrayList<>();
+        right.add("");
+        android.text.SpannableStringBuilder t = new android.text.SpannableStringBuilder();
+        t.append(span("vrfrida", DeviceInfo.TITLE, true)).append(span("@", DeviceInfo.TEXT, false)).append(span(Build.MODEL.replace(' ', '_'), DeviceInfo.TITLE, true));
+        right.add(t);
+        right.add(span(new String(new char[title.length()]).replace('\0', '-'), DeviceInfo.TEXT, false));
+        for (String[] r : rows) {
+            android.text.SpannableStringBuilder l = new android.text.SpannableStringBuilder();
+            l.append(span(r[0], DeviceInfo.KEY, true)).append("  ").append(span(r[1], DeviceInfo.TEXT, false));
+            right.add(l);
+        }
+        right.add("");
+        for (int row = 0; row < 2; row++) {
+            android.text.SpannableStringBuilder bl = new android.text.SpannableStringBuilder();
+            for (int c : DeviceInfo.BLOCKS) bl.append(span("███", row == 0 ? c : MenuLook.argb(new float[]{((c >> 16) & 255) / 255f * 0.6f, ((c >> 8) & 255) / 255f * 0.6f, (c & 255) / 255f * 0.6f, 1f}), false));
+            right.add(bl);
+        }
+        android.text.SpannableStringBuilder sb = new android.text.SpannableStringBuilder();
+        for (int i = 0; i < right.size(); i++) { sb.append(right.get(i)); if (i < right.size() - 1) sb.append('\n'); }
+        return sb;
+    }
+
+    /** fastfetch logo drawn cell by cell: block characters as exact rectangles, everything else centred in its cell */
+    final class LogoView extends View {
+        final String[] lines; final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final float cw, ch;
+        int cols;
+        LogoView(String[] src, float sp) {
+            super(MainActivity.this);
+            lines = src;
+            paint.setTypeface(Typeface.MONOSPACE);
+            paint.setTextSize(sp * getResources().getDisplayMetrics().scaledDensity);
+            cw = paint.measureText("M");
+            ch = paint.getFontSpacing() * 1.05f;
+            for (String l : src) cols = Math.max(cols, l.replaceAll("\\$[1-3]", "").length());
+        }
+        @Override protected void onMeasure(int w, int h) {
+            setMeasuredDimension((int) Math.ceil(cols * cw) + getPaddingLeft() + getPaddingRight(), (int) Math.ceil(lines.length * ch) + getPaddingTop() + getPaddingBottom());
+        }
+        @Override protected void onDraw(Canvas c) {
+            float x0 = getPaddingLeft(), y0 = getPaddingTop();
+            Paint.FontMetrics fm = paint.getFontMetrics();
+            for (int r = 0; r < lines.length; r++) {
+                String l = lines[r];
+                int color = DeviceInfo.C1, col = 0;
+                for (int i = 0; i < l.length(); i++) {
+                    char k = l.charAt(i);
+                    if (k == '$' && i + 1 < l.length() && l.charAt(i + 1) >= '1' && l.charAt(i + 1) <= '3') {
+                        int n = l.charAt(++i) - '0';
+                        color = n == 1 ? DeviceInfo.C1 : n == 2 ? DeviceInfo.C2 : DeviceInfo.C3;
+                        continue;
+                    }
+                    float x = x0 + col * cw, y = y0 + r * ch;
+                    col++;
+                    if (k == ' ') continue;
+                    paint.setColor(color);
+                    switch (k) {
+                        case '█': c.drawRect(x, y, x + cw + 0.5f, y + ch + 0.5f, paint); break;
+                        case '▀': c.drawRect(x, y, x + cw + 0.5f, y + ch / 2, paint); break;
+                        case '▄': c.drawRect(x, y + ch / 2, x + cw + 0.5f, y + ch + 0.5f, paint); break;
+                        case '░': case '▒': case '▓':
+                            paint.setAlpha(k == '░' ? 70 : k == '▒' ? 130 : 200);
+                            c.drawRect(x, y, x + cw + 0.5f, y + ch + 0.5f, paint);
+                            break;
+                        default:
+                            String g = String.valueOf(k);
+                            c.drawText(g, x + (cw - paint.measureText(g)) / 2, y + (ch - fm.bottom - fm.top) / 2, paint);
+                    }
+                }
+            }
+        }
+    }
+
+    CharSequence logoLine(String src, int width) {
+        android.text.SpannableStringBuilder sb = new android.text.SpannableStringBuilder();
+        int color = DeviceInfo.C1, vis = 0;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\$([1-3])").matcher(src);
+        int at = 0;
+        while (true) {
+            boolean f = m.find();
+            String chunk = src.substring(at, f ? m.start() : src.length());
+            if (!chunk.isEmpty()) { sb.append(span(chunk, color, false)); vis += chunk.length(); }
+            if (!f) break;
+            int k = m.group(1).charAt(0) - '0';
+            color = k == 1 ? DeviceInfo.C1 : k == 2 ? DeviceInfo.C2 : DeviceInfo.C3;
+            at = m.end();
+        }
+        for (; vis < width; vis++) sb.append(' ');
+        return sb;
+    }
+
+    /** debug report: [section] headers in the title colour, keys in the key colour, NO / NOT in red */
+    CharSequence colorReport(String rep) {
+        android.text.SpannableStringBuilder sb = new android.text.SpannableStringBuilder();
+        for (String line : rep.split("\n", -1)) {
+            if (line.startsWith("[")) sb.append(span(line, DeviceInfo.TITLE, true));
+            else if (line.startsWith("  ") && line.length() > 17) {
+                sb.append(span(line.substring(0, 17), DeviceInfo.KEY, false));
+                String v = line.substring(17);
+                sb.append(v.startsWith("NO") || v.startsWith("NOT") || v.contains("NOT granted") ? span(v, 0xFFFFB4AB, true) : span(v, DeviceInfo.TEXT, false));
+            } else sb.append(span(line, DeviceInfo.TEXT, false));
+            sb.append('\n');
+        }
+        return sb;
+    }
+
+    CharSequence span(String s, int color, boolean bold) {
+        android.text.SpannableString sp = new android.text.SpannableString(s);
+        sp.setSpan(new android.text.style.ForegroundColorSpan(color), 0, s.length(), 0);
+        if (bold) sp.setSpan(new android.text.style.StyleSpan(Typeface.BOLD), 0, s.length(), 0);
+        return sp;
+    }
+
+    void copyText(String label, String s) {
+        android.content.ClipboardManager cm = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        cm.setPrimaryClip(android.content.ClipData.newPlainText(label, s));
+        log("copied " + label + " to the clipboard (" + s.length() + " chars)");
+    }
+
+    static String readTail(File f, int max, String missing) {
+        if (!f.isFile()) return missing;
+        try {
+            byte[] b = Files.read(f);
+            String t = new String(b, "UTF-8");
+            return t.length() > max ? "…\n" + t.substring(t.length() - max) : t;
+        } catch (Exception e) { return "can't read " + f + ": " + e.getMessage(); }
+    }
+
+    // ---------------------------------------------------------------- Logcat tab
+    final GameLogcat logcat = new GameLogcat();
+    TextView logcatView, logcatHead;
+
+    boolean canReadLogs() { return rootOk || checkSelfPermission(android.Manifest.permission.READ_LOGS) == PackageManager.PERMISSION_GRANTED; }
+
+    void startLogcat(Game g) {
+        logcat.start(g.ai.packageName, g.ai.uid, rootOk, cfg.logcatWarn, () -> ui.post(this::refreshLogcat));
+        log("logcat: recording " + g.label + " -> " + GameLogcat.fileFor(g.ai.packageName));
+        ui.post(this::refreshLogcat);
+    }
+
+    void refreshLogcat() {
+        if (logcatView == null || tab != 6) return;
+        boolean atEnd = tabScroll != null && tabScroll.getScrollY() + tabScroll.getHeight() >= logcatView.getHeight() - 60;
+        logcatView.setText(logcat.pkg == null ? "" : logcat.text(30000));
+        if (logcatHead != null) logcatHead.setText(logcat.pkg == null ? "not recording"
+                : (logcat.running ? "recording " : "stopped: ") + logcat.pkg + "  ·  " + logcat.total + " lines  ·  saved to " + GameLogcat.fileFor(logcat.pkg));
+        if (atEnd && tabScroll != null) tabScroll.post(() -> tabScroll.fullScroll(View.FOCUS_DOWN));
+    }
+
+    View logcatTab() {
+        LinearLayout d = vbox();
+        String pkg = sel != null ? sel.ai.packageName : null;
+        TextView t = text(sel != null ? sel.label : "select a game on the Games tab", 20, m3("onSurface"));
+        d.addView(t);
+        if (!canReadLogs()) {
+            TextView w = text("No root: Android only shows vrfrida its own log lines. To see the game's, run this once from a PC (SideQuest / adb):\n"
+                    + "  adb shell pm grant dev.vrfrida android.permission.READ_LOGS\nthen fully close and reopen vrfrida. The Game log below works without it.", 13, col("NotifWarn"));
+            w.setTypeface(Typeface.MONOSPACE);
+            w.setTextIsSelectable(true);
+            w.setPadding(0, dp(6), 0, dp(6));
+            d.addView(w);
+        }
+        LinearLayout b = hbox();
+        b.addView(withIcon(button(logcat.running ? "Restart" : "Start", true, v -> { if (sel != null) startLogcat(sel); rebuild(); }, false), "play"), lpm(0, -2, 1, 3));
+        b.addView(withIcon(button("Stop", false, v -> { logcat.stop(); rebuild(); }, false), "stop"), lpm(0, -2, 1, 3));
+        b.addView(withIcon(button("Copy", false, v -> copyText("logcat", logcat.text(200000)), false), "upload"), lpm(0, -2, 1, 3));
+        b.addView(withIcon(button("Launch game", false, v -> launchAndInject(), true), "play"), lpm(0, -2, 1, 3));
+        d.addView(b);
+        if (pkg != null) {
+            d.addView(row("Start with Launch", checkbox(cfg.logcatOnLaunch, "record this game's logcat every time you press Launch", v -> { cfg.logcatOnLaunch = v; cfg.save(this, pkg); })));
+            d.addView(row("Warnings + errors only", checkbox(cfg.logcatWarn, "hide info / debug lines (applies on the next Start)", v -> { cfg.logcatWarn = v; cfg.save(this, pkg); })));
+        }
+        d.addView(section("Logcat"));
+        logcatHead = text("", 12, m3("onSurfaceVariant"));
+        d.addView(logcatHead);
+        logcatView = text("", 11, col("Text"));
+        logcatView.setTypeface(Typeface.MONOSPACE);
+        logcatView.setTextIsSelectable(true);
+        logcatView.setBackground(rrKey("FrameBg"));
+        logcatView.setPadding(dp(10), dp(8), dp(10), dp(8));
+        LinearLayout.LayoutParams lp = lp(-1, -2, 0);
+        lp.setMargins(0, dp(6), 0, 0);
+        d.addView(logcatView, lp);
+        if (pkg != null) {
+            d.addView(section("Game log (patched game: loader + menu messages, no root needed)"));
+            TextView gl = text(readTail(NoRoot.obbGameLog(pkg), 12000, "none yet (patch with this vrfrida version, then start the game)"), 11, col("Text"));
+            gl.setTypeface(Typeface.MONOSPACE);
+            gl.setTextIsSelectable(true);
+            gl.setBackground(rrKey("FrameBg"));
+            gl.setPadding(dp(10), dp(8), dp(10), dp(8));
+            d.addView(gl, lp(-1, -2, 0));
+        }
+        ui.post(this::refreshLogcat);
+        return d;
+    }
+
     View logTab() {
         LinearLayout d = vbox();
         LinearLayout head = hbox();

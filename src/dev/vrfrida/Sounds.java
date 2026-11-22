@@ -59,7 +59,7 @@ final class Sounds {
                 else convert(src, dst);
                 out.add(dst);
                 log.log("  converted " + base);
-            } catch (Exception e) {
+            } catch (Throwable e) {
                 dst.delete();
                 log.log("  couldn't convert " + base + ": " + e.getMessage());
             }
@@ -103,11 +103,18 @@ final class Sounds {
         int channels = fmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT) ? fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT) : 1;
         int rate = fmt.containsKey(MediaFormat.KEY_SAMPLE_RATE) ? fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE) : 44100;
         int encoding = AudioFormat.ENCODING_PCM_16BIT;
-        float[] mono = new float[1 << 16];
-        int count = 0;
+        // streamed: decode -> mono -> linear resample to 24 kHz -> straight into the file.
+        // nothing holds the whole track, so hour long files don't blow the heap
+        File tmp = new File(dst.getPath() + ".tmp");
+        long written = 0;     // output samples
+        long inIdx = -1;      // index of the latest input sample
+        float prev = 0, last = 0;
+        double step = 0;      // input samples per output sample, fixed once the real rate is known
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         boolean inDone = false, outDone = false;
-        try {
+        byte[] hdr = new byte[44];
+        try (java.io.BufferedOutputStream o = new java.io.BufferedOutputStream(new FileOutputStream(tmp), 1 << 16)) {
+            o.write(hdr);
             while (!outDone) {
                 if (!inDone) {
                     int ii = dec.dequeueInputBuffer(10000);
@@ -129,42 +136,57 @@ final class Sounds {
                     ob.position(info.offset);
                     ob.limit(info.offset + info.size);
                     ob.order(ByteOrder.LITTLE_ENDIAN);
+                    if (step == 0) step = (double) Math.max(1, rate) / RATE;
                     int bps = encoding == AudioFormat.ENCODING_PCM_FLOAT ? 4 : 2;
-                    int frames = info.size / (bps * channels);
-                    if (count + frames > mono.length) mono = Arrays.copyOf(mono, Math.max(mono.length * 2, count + frames));
+                    int frames = info.size / (bps * Math.max(1, channels));
                     for (int f = 0; f < frames; f++) {
                         float sum = 0;
                         for (int c = 0; c < channels; c++)
                             sum += bps == 4 ? ob.getFloat() : ob.getShort() / 32768f;
-                        mono[count++] = sum / channels;
+                        float cur = sum / channels;
+                        inIdx++;
+                        if (inIdx > 0) {
+                            // outputs whose position falls in [inIdx-1, inIdx)
+                            double p;
+                            while ((p = written * step) < inIdx) {
+                                float fr = (float) (p - (inIdx - 1));
+                                writeSample(o, prev * (1 - fr) + cur * fr);
+                                written++;
+                            }
+                        }
+                        prev = cur;
+                        last = cur;
                     }
                     dec.releaseOutputBuffer(oi, false);
                     if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outDone = true;
                 }
             }
+            // tail: same length the old code produced (count * RATE / rate)
+            long count = inIdx + 1;
+            long outN = count * RATE / Math.max(1, rate);
+            while (written < outN) { writeSample(o, last); written++; }
+        } catch (Throwable t) {
+            tmp.delete();
+            throw t;
         } finally {
             dec.stop();
             dec.release();
             ex.release();
         }
-
-        // linear resample to 24 kHz
-        int outN = (int) ((long) count * RATE / Math.max(1, rate));
-        ByteBuffer pcm = ByteBuffer.allocate(44 + outN * 2).order(ByteOrder.LITTLE_ENDIAN);
-        pcm.putInt(0x46464952).putInt(36 + outN * 2).putInt(0x45564157)
-           .putInt(0x20746d66).putInt(16).putShort((short) 1).putShort((short) 1)
-           .putInt(RATE).putInt(RATE * 2).putShort((short) 2).putShort((short) 16)
-           .putInt(0x61746164).putInt(outN * 2);
-        double step = (double) rate / RATE;
-        for (int i = 0; i < outN; i++) {
-            double p = i * step;
-            int a = (int) p;
-            float fr = (float) (p - a);
-            float v = a + 1 < count ? mono[a] * (1 - fr) + mono[a + 1] * fr : mono[Math.min(a, count - 1)];
-            pcm.putShort((short) Math.max(-32768, Math.min(32767, Math.round(v * 32767f))));
-        }
-        File tmp = new File(dst.getPath() + ".tmp");
-        try (FileOutputStream o = new FileOutputStream(tmp)) { o.write(pcm.array()); }
+        if (written * 2 > 0x7FFFFFF0L) { tmp.delete(); throw new Exception("too long for a wav"); }
+        int dataLen = (int) (written * 2);
+        ByteBuffer h = ByteBuffer.wrap(hdr).order(ByteOrder.LITTLE_ENDIAN);
+        h.putInt(0x46464952).putInt(36 + dataLen).putInt(0x45564157)
+         .putInt(0x20746d66).putInt(16).putShort((short) 1).putShort((short) 1)
+         .putInt(RATE).putInt(RATE * 2).putShort((short) 2).putShort((short) 16)
+         .putInt(0x61746164).putInt(dataLen);
+        try (RandomAccessFile r = new RandomAccessFile(tmp, "rw")) { r.seek(0); r.write(hdr); }
         if (!tmp.renameTo(dst)) throw new Exception("couldn't write " + dst);
+    }
+
+    private static void writeSample(java.io.OutputStream o, float v) throws java.io.IOException {
+        int s = Math.max(-32768, Math.min(32767, Math.round(v * 32767f)));
+        o.write(s & 0xff);
+        o.write((s >> 8) & 0xff);
     }
 }
