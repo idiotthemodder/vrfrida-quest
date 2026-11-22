@@ -788,7 +788,6 @@ public class MainActivity extends Activity {
         t.addView(statusView, lp(0, -2, 1));
         // Refresh also picks up a new PC sync (logo, patterns, plugins) without restarting the app
         t.addView(button("Refresh", false, v -> {
-            if (!rootOk) return;
             logo = null; look.bitmaps.clear();
             io.execute(this::scanGames);
         }, false));
@@ -859,7 +858,7 @@ public class MainActivity extends Activity {
         gameList.removeAllViews();
         List<Game> snapshot;
         synchronized (games) { snapshot = new ArrayList<>(games); }
-        if (snapshot.isEmpty()) { gameList.addView(text(rootOk ? "no Unity il2cpp games found" : "waiting for root...", 14, col("TextDisabled"))); return; }
+        if (snapshot.isEmpty()) { gameList.addView(text("no Unity il2cpp games found", 14, col("TextDisabled"))); return; }
         String s = search.trim().toLowerCase(Locale.US);
         int shown = 0;
         for (Game g : snapshot) {
