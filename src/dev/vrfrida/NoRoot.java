@@ -168,6 +168,8 @@ final class NoRoot {
 
     /** rewrite /sdcard/vrfrida/agents/<pkg>.gadget.js without repatching (used only if the game can read /sdcard) */
     void updateAgent(Core core, ApplicationInfo ai, Settings cfg) throws Exception {
+        if (!isPatched(ai))
+            throw new Exception("this game isn't patched yet (Patch + install never finished, check the log above for why). Update mods only works on a patched game: press Patch + install first");
         buildAgent(core, ai, cfg);
         log.log("wrote " + gadgetAgentFile(ai.packageName));
         log.log("the patched game loads it next start IF it can read /sdcard. If the menu doesn't change, use Patch + install again (installs as an update, keeps your game data)");
@@ -253,19 +255,67 @@ final class NoRoot {
         if (!needsUninstall) { new Thread(() -> commit(pkg, apks)).start(); return; }
         File obb = new File(Environment.getExternalStorageDirectory(), "Android/obb/" + pkg);
         obbKept = null;
+        android.content.SharedPreferences sp = act.getSharedPreferences("noroot", 0);
         if (obb.isDirectory()) {
-            File[] tries = {new File(obb.getParentFile(), pkg + ".vrfrida-keep"), new File(Paths.ROOT, "obb_keep/" + pkg)};
-            for (File t : tries) {
-                t.getParentFile().mkdirs();
-                if (obb.renameTo(t)) { obbKept = t; break; }
+            String[] inside = obb.list();
+            if (inside != null && inside.length == 0) {
+                // most Quest games have an empty OBB folder: nothing to lose, let the uninstall take it
+                log.log("the game's OBB folder is empty, nothing to keep");
+            } else {
+                // same folder only: Android/obb is a different mount than /sdcard, a rename across them always fails
+                File keep = new File(obb.getParentFile(), pkg + ".vrfrida-keep");
+                if (obb.renameTo(keep)) obbKept = keep;
+                if (obbKept == null) {
+                    obbBlocked(pkg, apks, obb, inside != null, sp);
+                    return;
+                }
+                log.log("moved the game's OBB aside to " + obbKept + " (it comes back after the install)");
             }
-            if (obbKept == null) {
-                log.log("this game has an OBB folder (" + obb + ") and the app can't move it aside, so uninstalling would delete it. Stopped. (allow \"Install unknown apps\" for vrfrida, that also gives access to Android/obb)");
-                done.run();
-                return;
-            }
-            log.log("moved the game's OBB aside to " + obbKept + " (it comes back after the install)");
         }
+        sp.edit().remove("obbRestart").apply();
+        uninstallThenInstall(pkg, apks);
+    }
+
+    /**
+     * couldn't move the OBB. Android hands Android/obb to an installer app only when its process starts, so right after
+     * "Install unknown apps" is switched on the running app still can't touch it: restart once. If it still fails after
+     * that, let the user decide (their OBB folder may well be empty, we just can't see it).
+     */
+    void obbBlocked(String pkg, List<File> apks, File obb, boolean canSee, android.content.SharedPreferences sp) {
+        boolean restarted = sp.getBoolean("obbRestart", false);
+        if (!restarted && !canSee) {
+            log.log("can't reach " + obb + " yet: Android only gives vrfrida OBB access after it restarts (needed once after allowing \"Install unknown apps\")");
+            new android.app.AlertDialog.Builder(act)
+                    .setTitle("Restart vrfrida")
+                    .setMessage("vrfrida has to restart once so Android lets it reach the game's OBB folder.\n\nAfter it reopens, select the game and press Patch + install again.\n\nIf it doesn't reopen by itself, open vrfrida again from your library.")
+                    .setPositiveButton("Restart", (d, w) -> {
+                        sp.edit().putBoolean("obbRestart", true).commit();
+                        restartApp();
+                    })
+                    .setNegativeButton("Cancel", (d, w) -> done.run())
+                    .setOnCancelListener(d -> done.run())
+                    .show();
+            return;
+        }
+        log.log("couldn't move the OBB folder (" + obb + ") aside" + (canSee ? "" : ", and vrfrida can't see inside it"));
+        new android.app.AlertDialog.Builder(act)
+                .setTitle("OBB folder")
+                .setMessage("vrfrida can't move this game's OBB folder out of the way, so uninstalling the store copy deletes it.\n\n" +
+                        "For most Quest games that folder is empty and nothing is lost. If the game does keep files there, the patched game may not start; then move " + obb + " somewhere safe with a file manager / SideQuest first.\n\nContinue anyway?")
+                .setPositiveButton("Continue", (d, w) -> { sp.edit().remove("obbRestart").apply(); uninstallThenInstall(pkg, apks); })
+                .setNegativeButton("Stop", (d, w) -> { log.log("stopped, nothing changed"); done.run(); })
+                .setOnCancelListener(d -> done.run())
+                .show();
+    }
+
+    void restartApp() {
+        Intent launch = act.getPackageManager().getLaunchIntentForPackage(act.getPackageName());
+        if (launch != null) act.startActivity(Intent.makeRestartActivityTask(launch.getComponent()));
+        act.finishAffinity();
+        Runtime.getRuntime().exit(0);
+    }
+
+    void uninstallThenInstall(String pkg, List<File> apks) {
         pending = pkg;
         pendingApks = apks;
         log.log("uninstalling the store copy of " + pkg + " (confirm in the system dialog)");
