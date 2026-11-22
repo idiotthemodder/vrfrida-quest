@@ -5,6 +5,8 @@
     android:versionName="1.0">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
+    <!-- app updates (GitHub Releases), plugin store (raw.githubusercontent.com), plugin uploads (chat_server Worker) -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
