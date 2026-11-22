@@ -14,6 +14,8 @@ final class Paths {
     static final File AGENTS = new File(ROOT, "agents");
     static final File LOGS = new File(ROOT, "logs");
     static final File RUN = new File(ROOT, "run");
+    static final File STORE = new File(ROOT, "store");                  // plugin store: installed.json, scan_rules.json
+    static final File STORE_PLUGINS = new File(STORE, "plugins");       // store installs (vrfrida.py --sync doesn't touch this)
 
     static String gameFiles(String pkg) { return "/sdcard/Android/data/" + pkg + "/files/imgui_plugins"; }
     static File log(String pkg) { return new File(LOGS, pkg + ".log"); }

@@ -64,13 +64,20 @@ final class Core {
 
     static List<File> pluginsFor(String pkg, Bridge.Log log) { return pluginsFor(pkg, log, null); }
 
+    /** plugins/ (PC sync) + store/plugins/ (Store tab), sorted by name. A local file wins over a store file with the same name */
+    static List<File> allPlugins() {
+        java.util.TreeMap<String, File> m = new java.util.TreeMap<>();
+        File[] st = Paths.STORE_PLUGINS.listFiles();
+        if (st != null) for (File f : st) if (f.isFile() && f.getName().toLowerCase().endsWith(".js")) m.put(f.getName(), f);
+        File[] fs = Paths.PLUGINS.listFiles();
+        if (fs != null) for (File f : fs) if (f.isFile() && f.getName().toLowerCase().endsWith(".js")) m.put(f.getName(), f);
+        return new ArrayList<>(m.values());
+    }
+
     /** plugins whose game line matches pkg (or "*"), minus the ones turned off for this game in the Plugins tab */
     static List<File> pluginsFor(String pkg, Bridge.Log log, java.util.Set<String> disabled) {
         List<File> match = new ArrayList<>();
-        File[] fs = Paths.PLUGINS.listFiles();
-        if (fs == null) return match;
-        Arrays.sort(fs);
-        for (File f : fs) {
+        for (File f : allPlugins()) {
             if (!f.isFile() || !f.getName().toLowerCase().endsWith(".js")) continue;
             List<String> games = pluginGames(f);
             if (!games.isEmpty()) {

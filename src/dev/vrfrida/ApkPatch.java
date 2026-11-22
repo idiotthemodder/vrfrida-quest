@@ -226,16 +226,97 @@ final class ApkPatch {
     }
 
     // ---------------------------------------------------------------- signing
+    // The patch key is per device, never shipped in the apk (the apk is a public download).
+    // Looked up in: app files/patchkey -> /sdcard/vrfrida/patchkey (survives reinstalling the app; put an old
+    // key.pk8 + cert.der there to keep repatching games signed with it) -> else a new RSA-2048 key + self-signed
+    // cert is made and saved to both. A new key means games patched with another key need one uninstall.
+    static final File SD_KEYDIR = new File(Paths.ROOT, "patchkey");
+
+    static File keyDir(Context ctx) throws Exception {
+        File app = new File(ctx.getFilesDir(), "patchkey");
+        if (new File(app, "key.pk8").isFile() && new File(app, "cert.der").isFile()) return app;
+        app.mkdirs();
+        if (new File(SD_KEYDIR, "key.pk8").isFile() && new File(SD_KEYDIR, "cert.der").isFile()) {
+            Files.write(new File(app, "key.pk8"), Files.read(new File(SD_KEYDIR, "key.pk8")));
+            Files.write(new File(app, "cert.der"), Files.read(new File(SD_KEYDIR, "cert.der")));
+            return app;
+        }
+        java.security.KeyPairGenerator g = java.security.KeyPairGenerator.getInstance("RSA");
+        g.initialize(2048);
+        java.security.KeyPair kp = g.generateKeyPair();
+        byte[] certDer = selfSigned(kp, "CN=vrfrida patch key");
+        Files.write(new File(app, "key.pk8"), kp.getPrivate().getEncoded());
+        Files.write(new File(app, "cert.der"), certDer);
+        try {
+            SD_KEYDIR.mkdirs();
+            Files.write(new File(SD_KEYDIR, "key.pk8"), kp.getPrivate().getEncoded());
+            Files.write(new File(SD_KEYDIR, "cert.der"), certDer);
+        } catch (Exception ignored) {}   // backup only
+        return app;
+    }
+
     static PrivateKey key(Context ctx) throws Exception {
-        byte[] k = Files.readAll(ctx.getAssets().open("patchkey/key.pk8"));
+        byte[] k = Files.read(new File(keyDir(ctx), "key.pk8"));
         return KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(k));
     }
 
     static X509Certificate cert(Context ctx) throws Exception {
-        return (X509Certificate) CertificateFactory.getInstance("X.509").generateCertificate(ctx.getAssets().open("patchkey/cert.der"));
+        return (X509Certificate) CertificateFactory.getInstance("X.509").generateCertificate(
+                new java.io.ByteArrayInputStream(Files.read(new File(keyDir(ctx), "cert.der"))));
     }
 
-    /** v2 + v3 signature with the bundled patch key. Every apk of one game must be signed with the same key */
+    // ---- minimal DER for a self-signed X.509 v3 cert (Android has no public cert builder)
+    private static byte[] der(int tag, byte[]... parts) {
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        for (byte[] p : parts) body.write(p, 0, p.length);
+        int n = body.size();
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        o.write(tag);
+        if (n < 128) o.write(n);
+        else if (n < 256) { o.write(0x81); o.write(n); }
+        else if (n < 65536) { o.write(0x82); o.write(n >> 8); o.write(n); }
+        else { o.write(0x83); o.write(n >> 16); o.write(n >> 8); o.write(n); }
+        o.write(body.toByteArray(), 0, n);
+        return o.toByteArray();
+    }
+
+    private static byte[] cnName(String cn) {   // Name: SEQ { SET { SEQ { OID 2.5.4.3, UTF8String } } }
+        return der(0x30, der(0x31, der(0x30, new byte[]{0x06, 0x03, 0x55, 0x04, 0x03},
+                der(0x0c, cn.getBytes(StandardCharsets.UTF_8)))));
+    }
+
+    private static byte[] genTime(long ms) {
+        java.text.SimpleDateFormat f = new java.text.SimpleDateFormat("yyyyMMddHHmmss'Z'", java.util.Locale.US);
+        f.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+        return der(0x18, f.format(new java.util.Date(ms)).getBytes(StandardCharsets.US_ASCII));
+    }
+
+    static byte[] selfSigned(java.security.KeyPair kp, String dn) throws Exception {
+        byte[] sha256Rsa = der(0x30, new byte[]{0x06, 0x09, 0x2a, (byte) 0x86, 0x48, (byte) 0x86, (byte) 0xf7, 0x0d, 0x01, 0x01, 0x0b},
+                new byte[]{0x05, 0x00});
+        byte[] serialBytes = new byte[16];
+        new java.security.SecureRandom().nextBytes(serialBytes);
+        serialBytes[0] &= 0x7f;   // positive INTEGER
+        long now = System.currentTimeMillis();
+        byte[] name = cnName(dn.startsWith("CN=") ? dn.substring(3) : dn);
+        byte[] tbs = der(0x30,
+                der(0xa0, new byte[]{0x02, 0x01, 0x02}),          // version v3
+                der(0x02, serialBytes),
+                sha256Rsa,
+                name,
+                der(0x30, genTime(now - 86400000L), genTime(now + 30L * 365 * 86400000L)),
+                name,
+                kp.getPublic().getEncoded());                    // SubjectPublicKeyInfo
+        java.security.Signature s = java.security.Signature.getInstance("SHA256withRSA");
+        s.initSign(kp.getPrivate());
+        s.update(tbs);
+        byte[] sig = s.sign();
+        byte[] bitString = new byte[sig.length + 1];              // leading 0 = no unused bits
+        System.arraycopy(sig, 0, bitString, 1, sig.length);
+        return der(0x30, tbs, sha256Rsa, der(0x03, bitString));
+    }
+
+    /** v2 + v3 signature with this device's patch key. Every apk of one game must be signed with the same key */
     static void sign(Context ctx, File unsigned, File out) throws Exception {
         com.android.apksig.ApkSigner.SignerConfig sc = new com.android.apksig.ApkSigner.SignerConfig.Builder(
                 "vrfrida", key(ctx), Collections.singletonList(cert(ctx))).build();

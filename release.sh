@@ -11,7 +11,9 @@ gh auth status >/dev/null 2>&1 || { echo "run: gh auth login"; exit 1; }
 [ "$(gh repo view "$REPO" --json visibility -q .visibility 2>/dev/null)" = "PUBLIC" ] || { echo "$REPO doesn't exist or isn't public (the app can't download from a private repo)"; exit 1; }
 V=$(( $(cat version.txt 2>/dev/null || echo 1) + 1 ))
 echo "$V" > version.txt
-./build.sh
+LEAN=1 ./build.sh
+# never publish an apk that carries a private key, plugins or sounds
+unzip -l vrfrida.apk | grep -qE "assets/(patchkey/|seed/plugins/.|seed/sounds/.)" && { echo "apk contains patchkey/plugins/sounds, not releasing"; exit 1; }
 cp build/assets/menu.js build/menu.js
 gh release create "v$V" vrfrida.apk build/menu.js --repo "$REPO" --title "vrfrida v$V" --notes "${1:-vrfrida v$V}"
 echo "released v$V: the app picks it up on its next check (or Log tab -> Check for updates)"

@@ -53,7 +53,7 @@ import java.util.concurrent.Executors;
 
 /** the app, drawn to look like UniversalMenu (same themes, backgrounds and widgets) */
 public class MainActivity extends Activity {
-    static final String[] TABS = {"Games", "Plugins", "Menu Look", "Log"};
+    static final String[] TABS = {"Games", "Plugins", "Store", "Menu Look", "Log"};
 
     static final class Game {
         ApplicationInfo ai; String label; Bitmap icon; String fp = ""; String bridge = "?"; boolean running, injected, fav, patched;
@@ -69,6 +69,10 @@ public class MainActivity extends Activity {
     NoRoot noRoot;
     Updater updater;
     Updater.Release update;               // newer release found by the last check, null = none
+    Store store;
+    volatile int storeWaiting;            // community plugin updates waiting for review
+    volatile boolean storeLoading;
+    int storeFilter = 0;                  // 0 = selected game, 1 = all games
     MenuLook look;
     MenuCfg appLook, gameCfg, globalCfg;  // appLook: app-only prefs (colors source, animation). globalCfg: the synced look
     String gameCfgFor = "", gameCfgState = "";
@@ -93,6 +97,7 @@ public class MainActivity extends Activity {
         super.onCreate(b);
         core = new Core(this, this::log);
         updater = new Updater(this, this::log);
+        store = new Store(this, this::log);
         noRoot = new NoRoot(this, this::log, () -> { setBusy(false); bg.execute(this::scanGames); });
         look = new MenuLook(this);
         appLook = MenuCfg.parse(look, dev.vrfrida.Settings.prefs(this).getString("applook", "{}"));
@@ -142,6 +147,7 @@ public class MainActivity extends Activity {
             }
         }
         core.seedIfEmpty();
+        autoStoreUpdate();
         core.writeSpoofScript();        // appsafety spoof script on disk, ready for a launch
         look.bitmaps.clear();          // pattern pngs exist now
         if (rootOk && !new File(core.injector()).isFile()) log("frida-inject is missing from the app (" + core.injector() + "), rebuild the apk");
@@ -269,7 +275,7 @@ public class MainActivity extends Activity {
                 if (sel != g) return;
                 gameCfg = c;
                 gameCfgState = text.trim().isEmpty() ? "no settings.json yet: showing the menu defaults (saved on first change)" : "loaded from the game";
-                if (tab == 2) rebuild();
+                if (tab == 3) rebuild();
             });
         });
     }
@@ -327,7 +333,7 @@ public class MainActivity extends Activity {
             int fn = n;
             ui.post(() -> {
                 setBusy(false);
-                if (sel != null && tab == 2 && lookScope == 1) loadGameCfg(sel);
+                if (sel != null && tab == 3 && lookScope == 1) loadGameCfg(sel);
                 if (fn == 0 && globalCfg.menu().length() == 0) log("nothing to apply yet: change something under All games first");
             });
         });
@@ -339,7 +345,7 @@ public class MainActivity extends Activity {
 
     /** the settings the window background follows: the synced look, or the selected game's while editing that */
     MenuCfg shownCfg() {
-        if (tab == 2 && lookScope == 1 && gameCfg != null) return gameCfg;
+        if (tab == 3 && lookScope == 1 && gameCfg != null) return gameCfg;
         return globalCfg;
     }
 
@@ -442,13 +448,13 @@ public class MainActivity extends Activity {
         long now = System.currentTimeMillis();
         if (Updater.repo(this).isEmpty() || now - sp.getLong("updateCheckedAt", 0) < 6 * 3600_000L) return;
         sp.edit().putLong("updateCheckedAt", now).apply();
-        new Thread(() -> { Updater.Release r = updater.check(true); if (r != null) ui.post(() -> { update = r; if (tab == 3) rebuild(); }); }).start();
+        new Thread(() -> { Updater.Release r = updater.check(true); if (r != null) ui.post(() -> { update = r; if (tab == 4) rebuild(); }); }).start();
     }
 
     void checkUpdate() {
         dev.vrfrida.Settings.prefs(this).edit().putLong("updateCheckedAt", System.currentTimeMillis()).apply();
         log("checking github.com/" + Updater.repo(this) + " for updates");
-        new Thread(() -> { Updater.Release r = updater.check(false); ui.post(() -> { update = r; if (tab == 3) rebuild(); }); }).start();
+        new Thread(() -> { Updater.Release r = updater.check(false); ui.post(() -> { update = r; if (tab == 4) rebuild(); }); }).start();
     }
 
     void installUpdate() {
@@ -541,7 +547,7 @@ public class MainActivity extends Activity {
 
     void updateStatusLine() {
         if (statusView == null) return;
-        String extra = tab == 2 && lookScope == 1 && sel != null ? "  ·  " + gameCfgState : "";
+        String extra = tab == 3 && lookScope == 1 && sel != null ? "  ·  " + gameCfgState : "";
         statusView.setText(status + extra);
     }
 
@@ -740,7 +746,7 @@ public class MainActivity extends Activity {
         tabScroll = new ScrollView(this);
         tabScroll.setFillViewport(true);
         tabScroll.setVerticalScrollBarEnabled(true);
-        View body = tab == 0 ? gamesTab() : tab == 1 ? pluginsTab() : tab == 2 ? lookTab() : logTab();
+        View body = tab == 0 ? gamesTab() : tab == 1 ? pluginsTab() : tab == 2 ? storeTab() : tab == 3 ? lookTab() : logTab();
         tabScroll.addView(body);
         tabScroll.setPadding(dp(10), dp(6), dp(10), dp(10));
         tabScroll.setClipToPadding(false);
@@ -795,7 +801,7 @@ public class MainActivity extends Activity {
         LinearLayout bar = hbox();
         for (int i = 0; i < TABS.length; i++) {
             final int k = i;
-            TextView t = text(TABS[i], 15, i == tab ? col("TextOnActive") : col("Text"));
+            TextView t = text(i == 2 && storeWaiting > 0 ? TABS[i] + " (" + storeWaiting + ")" : TABS[i], 15, i == tab ? col("TextOnActive") : col("Text"));
             t.setGravity(Gravity.CENTER);
             t.setPadding(0, dp(9), 0, dp(9));
             t.setBackground(rrKey(i == tab ? "TabActive" : "Tab"));
@@ -925,7 +931,7 @@ public class MainActivity extends Activity {
         d.addView(r1);
         LinearLayout r2 = hbox();
         r2.addView(button("Plugins ›", false, v -> goTab(1), false), lpm(0, -2, 1, 3));
-        r2.addView(button("Menu look ›", false, v -> { lookScope = cfg.followGlobal ? 0 : 1; goTab(2); }, false), lpm(0, -2, 1, 3));
+        r2.addView(button("Menu look ›", false, v -> { lookScope = cfg.followGlobal ? 0 : 1; goTab(3); }, false), lpm(0, -2, 1, 3));
         r2.addView(button("Rebuild bridge", false, v -> job("rebuild bridge", g -> Bridge.ensure(this, g.ai, true, this::log)), true), lpm(0, -2, 1, 3));
         d.addView(r2);
 
@@ -959,7 +965,7 @@ public class MainActivity extends Activity {
         miniLog.setTypeface(Typeface.MONOSPACE);
         miniLog.setBackground(rrKey("FrameBg"));
         miniLog.setPadding(dp(10), dp(8), dp(10), dp(8));
-        miniLog.setOnClickListener(v -> goTab(3));
+        miniLog.setOnClickListener(v -> goTab(4));
         LinearLayout.LayoutParams lp = lp(-1, -2, 0);
         lp.setMargins(0, dp(4), 0, 0);
         d.addView(miniLog, lp);
@@ -1015,9 +1021,8 @@ public class MainActivity extends Activity {
             })));
         }
 
-        File[] all = Paths.PLUGINS.listFiles((dir, n) -> n.toLowerCase(Locale.US).endsWith(".js"));
         List<String> others = new ArrayList<>();
-        if (all != null) for (File f : all) if (!mineNames.contains(f.getName())) {
+        for (File f : Core.allPlugins()) if (!mineNames.contains(f.getName())) {
             List<String> gs = Core.pluginGames(f);
             others.add(f.getName() + "   ·   " + (gs.isEmpty() ? "no game line" : "for " + String.join(", ", gs)));
         }
@@ -1028,10 +1033,382 @@ public class MainActivity extends Activity {
             o.setPadding(dp(6), dp(6), 0, 0);
             d.addView(o);
         }
-        TextView w = text("Plugin files live in " + Paths.PLUGINS + " (vrfrida.py --sync on the PC updates them).", 12, col("TextDisabled"));
+        TextView w = text("Plugin files live in " + Paths.PLUGINS + " (vrfrida.py --sync on the PC updates them) and " + Paths.STORE_PLUGINS + " (Store tab).", 12, col("TextDisabled"));
         w.setPadding(dp(4), dp(10), 0, 0);
         d.addView(w);
         return d;
+    }
+
+    // ---------------------------------------------------------------- Store tab
+    /** official plugins update by themselves at most every 6 h; community updates only get counted (they need review) */
+    void autoStoreUpdate() {
+        SharedPreferences sp = dev.vrfrida.Settings.prefs(this);
+        long now = System.currentTimeMillis();
+        if (Store.repo(this).isEmpty() || now - sp.getLong("storeCheckedAt", 0) < 6 * 3600_000L) return;
+        sp.edit().putLong("storeCheckedAt", now).apply();
+        new Thread(() -> { int w = store.autoUpdate(); ui.post(() -> { storeWaiting = w; rebuild(); }); }).start();
+    }
+
+    void loadStore() {
+        if (storeLoading) return;
+        storeLoading = true;
+        new Thread(() -> {
+            store.refresh();
+            int w = store.updates(false).size();
+            ui.post(() -> { storeLoading = false; storeWaiting = w; if (tab == 2) rebuild(); });
+        }).start();
+    }
+
+    int sevColor(String sev) { return sev.equals("high") ? col("NotifError") : sev.equals("medium") ? col("NotifWarn") : col("TextDisabled"); }
+
+    TextView badge(String s, int color) {
+        TextView b = text(s, 11, Color.WHITE);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setPadding(dp(7), dp(2), dp(7), dp(2));
+        b.setBackground(rr(color, 6));
+        return b;
+    }
+
+    View storeTab() {
+        LinearLayout d = vbox();
+        LinearLayout head = hbox();
+        TextView t = text("Plugin store", 19, col("Text"));
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        head.addView(t, lp(0, -2, 1));
+        head.addView(button(storeLoading ? "Loading..." : "Refresh", false, v -> loadStore(), false), lpm(-2, -2, 0, 3));
+        head.addView(button("Upload a plugin", false, v -> uploadDialog(), false), lpm(-2, -2, 0, 3));
+        d.addView(head);
+
+        List<Store.Plugin> idx = store.index;
+        if (idx == null || System.currentTimeMillis() - store.indexAt > 10 * 60_000L) loadStore();
+        if (idx == null) {
+            d.addView(text(store.error.isEmpty() ? "loading the plugin list from github.com/" + Store.repo(this) + " ..." : "couldn't load the store: " + store.error, 14, col("TextDisabled")));
+            return d;
+        }
+        String[] filters = {sel != null ? "For " + sel.label : "For the selected game", "All games"};
+        if (sel == null) storeFilter = 1;
+        d.addView(row("Show", combo(filters, storeFilter, k -> { storeFilter = k; rebuild(); })));
+        TextView h = text(idx.size() + " plugins. OFFICIAL = made by idiotthemodder, updates by itself. COMMUNITY = uploaded by anyone, NOT checked: read the code before you install. Installed plugins load on the next Launch / Inject.", 13, col("TextDisabled"));
+        h.setPadding(dp(4), dp(6), 0, 0);
+        d.addView(h);
+
+        List<Store.Plugin> ups = store.updates(null);
+        if (!ups.isEmpty()) {
+            d.addView(section("Updates (" + ups.size() + ")"));
+            for (Store.Plugin p : ups) d.addView(pluginCard(p));
+        }
+        List<Store.Plugin> shown = new ArrayList<>();
+        for (Store.Plugin p : idx) if (!ups.contains(p) && (storeFilter == 1 || sel == null || p.forGame(sel.ai.packageName))) shown.add(p);
+        shown.sort((a, b) -> a.trusted != b.trusted ? (a.trusted ? -1 : 1) : a.name.compareToIgnoreCase(b.name));
+        d.addView(section(storeFilter == 0 && sel != null ? "For " + sel.label + " (" + shown.size() + ")" : "All plugins (" + shown.size() + ")"));
+        if (shown.isEmpty()) d.addView(text(storeFilter == 0 ? "nothing for this game yet. Try \"All games\", or upload one." : "the store is empty", 14, col("TextDisabled")));
+        for (Store.Plugin p : shown) d.addView(pluginCard(p));
+        return d;
+    }
+
+    View pluginCard(Store.Plugin p) {
+        LinearLayout c = vbox();
+        c.setBackground(rrKey("RowBg"));
+        c.setPadding(dp(12), dp(8), dp(10), dp(8));
+        LinearLayout.LayoutParams cp = lp(-1, -2, 0);
+        cp.setMargins(0, dp(4), 0, 0);
+        c.setLayoutParams(cp);
+        Store.Installed inst = store.installedOf(p.id);
+        boolean hasUpdate = inst != null && !inst.version.equals(p.version);
+
+        LinearLayout top = hbox();
+        TextView n = text(p.name, 16, col("Text"));
+        n.setTypeface(Typeface.DEFAULT_BOLD);
+        top.addView(n);
+        LinearLayout.LayoutParams bp = lp(-2, -2, 0);
+        bp.setMargins(dp(8), 0, 0, 0);
+        top.addView(p.trusted ? badge("OFFICIAL", col("NotifSuccess")) : badge("COMMUNITY · UNTRUSTED", col("NotifError")), bp);
+        if (inst != null) { LinearLayout.LayoutParams ip = lp(-2, -2, 0); ip.setMargins(dp(6), 0, 0, 0); top.addView(badge(hasUpdate ? "UPDATE" : "INSTALLED", col("TabActive")), ip); }
+        c.addView(top);
+        if (!p.desc.isEmpty()) { TextView ds = text(p.desc, 13, col("Text")); ds.setPadding(0, dp(3), 0, 0); c.addView(ds); }
+        String meta = (p.games.isEmpty() ? "no game line" : "for " + String.join(", ", p.games)) + "  ·  by " + (p.author.isEmpty() ? "?" : p.author)
+                + "  ·  " + p.files.size() + (p.files.size() == 1 ? " file" : " files") + ", " + Math.max(1, p.size() / 1024) + " KB  ·  " + p.updated;
+        TextView m = text(meta, 12, col("TextDisabled"));
+        m.setPadding(0, dp(2), 0, 0);
+        c.addView(m);
+        TextView sc = text("scan: " + p.high + " high · " + p.medium + " medium · " + p.low + " low", 12, p.high > 0 ? col("NotifError") : p.medium > 0 ? col("NotifWarn") : col("TextDisabled"));
+        c.addView(sc);
+
+        LinearLayout btns = hbox();
+        btns.setPadding(0, dp(6), 0, 0);
+        if (inst == null) btns.addView(button("Install", true, v -> startInstall(p), true), lpm(0, -2, 1, 3));
+        else if (hasUpdate) btns.addView(button("Update", true, v -> startInstall(p), true), lpm(0, -2, 1, 3));
+        btns.addView(button("View code", false, v -> fetchThen(p, files -> showCode(p.name, files)), false), lpm(0, -2, 1, 3));
+        if (inst != null) btns.addView(dangerButton("Remove", v -> bg.execute(() -> {
+            try { store.remove(p.id); } catch (Exception e) { log("store: remove failed: " + e.getMessage()); }
+            ui.post(() -> { storeWaiting = store.updates(false).size(); rebuild(); });
+        })), lpm(0, -2, 1, 3));
+        c.addView(btns);
+        return c;
+    }
+
+    /** download (sha-checked) on the bg thread, then run `then` on the ui thread */
+    void fetchThen(Store.Plugin p, java.util.function.Consumer<Map<String, byte[]>> then) {
+        if (busy) return;
+        setBusy(true);
+        setStatus("downloading " + p.name + "...");
+        bg.execute(() -> {
+            try {
+                Map<String, byte[]> files = store.download(p);
+                ui.post(() -> { setBusy(false); setStatus("ready"); then.accept(files); });
+            } catch (Exception e) {
+                log("store: download of " + p.name + " failed: " + e.getMessage());
+                ui.post(() -> { setBusy(false); setStatus("download failed"); });
+            }
+        });
+    }
+
+    void startInstall(Store.Plugin p) {
+        fetchThen(p, files -> {
+            if (p.trusted) { doInstall(p, files); return; }
+            String code, old;
+            try { code = Store.jsText(files); } catch (Exception e) { log("store: " + e.getMessage()); return; }
+            old = store.installedText(p.id);
+            untrustedDialog(p, files, code, old);
+        });
+    }
+
+    void doInstall(Store.Plugin p, Map<String, byte[]> files) {
+        setBusy(true);
+        bg.execute(() -> {
+            try { store.install(p, files); } catch (Exception e) { log("store: install of " + p.name + " failed: " + e.getMessage()); }
+            ui.post(() -> { setBusy(false); storeWaiting = store.updates(false).size(); rebuild(); });
+        });
+    }
+
+    /** a themed dialog: content on top, buttons at the bottom */
+    android.app.Dialog themedDialog(View content, View buttons) {
+        android.app.Dialog dl = new android.app.Dialog(this);
+        dl.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+        LinearLayout box = vbox();
+        box.setBackground(rr(MenuLook.argb(MenuLook.a(C.get("PopupBg"), 1)), Math.max(4, rounding())));
+        box.setPadding(dp(16), dp(14), dp(16), dp(12));
+        ScrollView sv = new ScrollView(this);
+        sv.addView(content);
+        box.addView(sv, lp(-1, 0, 1));
+        if (buttons != null) { buttons.setPadding(0, dp(10), 0, 0); box.addView(buttons, lp(-1, -2, 0)); }
+        dl.setContentView(box);
+        android.view.Window w = dl.getWindow();
+        if (w != null) {
+            w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            w.setLayout((int) (getResources().getDisplayMetrics().widthPixels * 0.8f), (int) (getResources().getDisplayMetrics().heightPixels * 0.85f));
+        }
+        return dl;
+    }
+
+    /** lines in `now` that aren't in `before` (multiset), and how many went away */
+    static String[] lineDiff(String before, String now) {
+        Map<String, Integer> have = new java.util.HashMap<>();
+        for (String l : before.split("\n")) have.merge(l, 1, Integer::sum);
+        StringBuilder added = new StringBuilder();
+        int nAdd = 0;
+        for (String l : now.split("\n")) {
+            Integer k = have.get(l);
+            if (k != null && k > 0) have.put(l, k - 1);
+            else { nAdd++; if (nAdd <= 80) added.append("+ ").append(l.length() > 160 ? l.substring(0, 160) + "..." : l).append('\n'); }
+        }
+        int nDel = 0;
+        for (int v : have.values()) nDel += v;
+        if (nAdd > 80) added.append("... and ").append(nAdd - 80).append(" more added lines (View code shows everything)\n");
+        return new String[]{String.valueOf(nAdd), String.valueOf(nDel), added.toString()};
+    }
+
+    void untrustedDialog(Store.Plugin p, Map<String, byte[]> files, String code, String old) {
+        boolean isUpdate = !old.isEmpty();
+        LinearLayout v = vbox();
+        TextView warn = text("⚠  NOT TRUSTED  ⚠", 22, col("NotifError"));
+        warn.setTypeface(Typeface.DEFAULT_BOLD);
+        warn.setGravity(Gravity.CENTER);
+        v.addView(warn, lp(-1, -2, 0));
+        TextView msg = text((isUpdate ? "Update for \"" : "\"") + p.name + "\" was uploaded by " + (p.author.isEmpty() ? "someone" : "\"" + p.author + "\"")
+                + ", not by idiotthemodder. Nobody has checked that it is safe.\n\n"
+                + "A plugin runs inside the game with the game's full access: your account in that game, its saves, and the internet. "
+                + "A bad plugin can steal your account or ruin your saves.\n\n"
+                + "DO NOT INSTALL ANYTHING BEFORE YOU HAVE LOOKED AT THE CODE YOURSELF (View code), and read the scan below."
+                + (isUpdate ? " The code changed since you installed it: read what's new, an update can add malware to a plugin that was fine." : ""), 14, col("Text"));
+        msg.setPadding(0, dp(8), 0, dp(4));
+        v.addView(msg);
+
+        List<Scanner.Finding> now = Scanner.scan(this, code);
+        if (isUpdate) {
+            Set<String> before = new java.util.HashSet<>();
+            for (Scanner.Finding f : Scanner.scan(this, old)) before.add(f.id);
+            String[] df = lineDiff(old, code);
+            v.addView(section("What changed: +" + df[0] + " / -" + df[1] + " lines"));
+            List<String> fresh = new ArrayList<>();
+            for (Scanner.Finding f : now) if (!before.contains(f.id)) fresh.add("[" + f.sev.toUpperCase(Locale.US) + "] " + f.label);
+            if (!fresh.isEmpty()) {
+                TextView nf = text("NEW in this version:\n" + String.join("\n", fresh), 14, col("NotifError"));
+                nf.setTypeface(Typeface.DEFAULT_BOLD);
+                nf.setPadding(0, dp(4), 0, dp(4));
+                v.addView(nf);
+            }
+            TextView add = text(df[2].isEmpty() ? "(only removed lines)" : df[2], 11, col("Text"));
+            add.setTypeface(Typeface.MONOSPACE);
+            add.setBackground(rrKey("FrameBg"));
+            add.setPadding(dp(8), dp(6), dp(8), dp(6));
+            v.addView(add);
+        }
+
+        int[] cnt = Scanner.counts(now);
+        v.addView(section("Safety scan: " + cnt[0] + " high · " + cnt[1] + " medium · " + cnt[2] + " low"));
+        if (now.isEmpty()) v.addView(text("The scan found none of the patterns it knows. That does NOT mean it is safe: it only knows patterns, and clever or hidden code gets past it. Still read the code.", 13, col("NotifWarn")));
+        for (Scanner.Finding f : now) {
+            TextView l = text("[" + f.sev.toUpperCase(Locale.US) + "]  " + f.label + "  (" + f.count + "x)", 14, sevColor(f.sev));
+            l.setTypeface(Typeface.DEFAULT_BOLD);
+            l.setPadding(0, dp(6), 0, 0);
+            v.addView(l);
+            v.addView(text(f.why, 12, col("TextDisabled")));
+            if (!f.hits.isEmpty()) {
+                TextView hits = text(String.join("\n", f.hits), 11, col("Text"));
+                hits.setTypeface(Typeface.MONOSPACE);
+                hits.setPadding(dp(8), dp(2), 0, 0);
+                v.addView(hits);
+            }
+        }
+        TextView tip = text("Red flags: sending data to the internet (Discord webhooks, Telegram, paste sites, raw IPs), running shell commands, eval / new Function, reading tokens or other apps' folders, obfuscated code (_0x names, long \\x.. strings, big base64 blobs). If you don't understand the code, don't install it.", 12, col("TextDisabled"));
+        tip.setPadding(0, dp(10), 0, dp(6));
+        v.addView(tip);
+        final boolean[] ok = {false};
+        LinearLayout btns = vbox();
+        TextView[] go = new TextView[1];
+        btns.addView(checkbox(false, "I read the code myself and I accept the risk", b -> { ok[0] = b; go[0].setEnabled(b); go[0].setAlpha(b ? 1f : 0.45f); }));
+        LinearLayout r = hbox();
+        r.setPadding(0, dp(8), 0, 0);
+        android.app.Dialog[] dl = new android.app.Dialog[1];
+        r.addView(button("View code", false, x -> showCode(p.name, files), false), lpm(0, -2, 1, 3));
+        r.addView(button("Cancel", false, x -> dl[0].dismiss(), false), lpm(0, -2, 1, 3));
+        go[0] = dangerButton(isUpdate ? "Install update" : "Install anyway", x -> { if (!ok[0]) return; dl[0].dismiss(); doInstall(p, files); });
+        actions.remove(go[0]);
+        go[0].setEnabled(false); go[0].setAlpha(0.45f);
+        r.addView(go[0], lpm(0, -2, 1, 3));
+        btns.addView(r);
+        dl[0] = themedDialog(v, btns);
+        dl[0].show();
+    }
+
+    void showCode(String title, Map<String, byte[]> files) {
+        String code;
+        try { code = Store.jsText(files); } catch (Exception e) { code = e.toString(); }
+        LinearLayout v = vbox();
+        TextView t = text(title + "  ·  " + code.split("\n").length + " lines", 16, col("Text"));
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        v.addView(t);
+        int cap = 250_000;
+        TextView c = text(code.length() > cap ? code.substring(0, cap) + "\n\n... cut at 250 KB here. The full file is " + code.length() / 1024 + " KB: read it on a PC before trusting it." : code, 11, col("Text"));
+        c.setTypeface(Typeface.MONOSPACE);
+        c.setTextIsSelectable(true);
+        c.setBackground(rrKey("FrameBg"));
+        c.setPadding(dp(8), dp(6), dp(8), dp(6));
+        v.addView(c);
+        android.app.Dialog[] dl = new android.app.Dialog[1];
+        LinearLayout r = hbox();
+        r.addView(button("Close", true, x -> dl[0].dismiss(), false), lpm(0, -2, 1, 3));
+        dl[0] = themedDialog(v, r);
+        dl[0].show();
+    }
+
+    EditText field(String hint, String value, int maxLen) {
+        EditText e = new EditText(this);
+        e.setSingleLine(true);
+        e.setHint(hint);
+        e.setText(value);
+        e.setTextSize(15);
+        e.setTextColor(col("Text"));
+        e.setHintTextColor(col("TextDisabled"));
+        e.setBackground(rrKey("FrameBg"));
+        e.setPadding(dp(12), dp(8), dp(12), dp(8));
+        e.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(maxLen)});
+        return e;
+    }
+
+    void uploadDialog() {
+        List<File> cands = new ArrayList<>();
+        for (File dir : new File[]{Paths.PLUGINS, new File(Paths.ROOT, "upload"), new File("/sdcard/Download")}) {
+            File[] fs = dir.listFiles((x, n) -> n.toLowerCase(Locale.US).endsWith(".js"));
+            if (fs != null) { java.util.Arrays.sort(fs); for (File f : fs) if (f.length() <= 600 * 1024) cands.add(f); }
+        }
+        LinearLayout v = vbox();
+        TextView t = text("Upload a plugin", 19, col("Text"));
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        v.addView(t);
+        v.addView(text("It goes into a review queue. If it's approved it shows up in the store for everyone as COMMUNITY (untrusted), with your code public. "
+                + "Only upload your own work (or with the author's permission). Max 600 KB, and it needs a \"// game: <package>\" line near the top.", 13, col("TextDisabled")));
+        if (cands.isEmpty()) {
+            v.addView(text("\nNo .js files found. Put your plugin in " + Paths.PLUGINS + ", " + new File(Paths.ROOT, "upload") + " or /sdcard/Download.", 14, col("NotifWarn")));
+            android.app.Dialog[] dl = new android.app.Dialog[1];
+            LinearLayout r = hbox();
+            r.addView(button("Close", true, x -> dl[0].dismiss(), false), lpm(0, -2, 1, 3));
+            dl[0] = themedDialog(v, r);
+            dl[0].show();
+            return;
+        }
+        String[] labels = new String[cands.size()];
+        for (int i = 0; i < labels.length; i++) labels[i] = cands.get(i).getParentFile().getName() + "/" + cands.get(i).getName();
+        int[] pick = {0};
+        TextView gameInfo = text("", 13, col("TextDisabled"));
+        EditText name = field("name shown in the store", "", 40);
+        EditText desc = field("what it does (one line)", "", 300);
+        EditText author = field("your name", dev.vrfrida.Settings.prefs(this).getString("storeAuthor", ""), 32);
+        List<String> mineCommunity = new ArrayList<>();
+        mineCommunity.add("(a new plugin)");
+        if (store.index != null) for (Store.Plugin p : store.index) if (!p.trusted) mineCommunity.add(p.id);
+        int[] upd = {0};
+        Runnable onPick = () -> {
+            File f = cands.get(pick[0]);
+            List<String> gs = Core.pluginGames(f);
+            gameInfo.setText(gs.isEmpty() ? "⚠ this file has no // game: line, the server will refuse it" : "for " + String.join(", ", gs) + "  ·  " + Math.max(1, f.length() / 1024) + " KB");
+            if (name.getText().length() == 0) name.setText(f.getName().replaceAll("\\.js$", "").replace('_', ' '));
+            if (desc.getText().length() == 0) desc.setText(pluginDesc(f));
+        };
+        View[] fileCombo = new View[1];
+        LinearLayout fileRow = hbox();
+        java.util.function.Consumer<Integer>[] setPick = new java.util.function.Consumer[1];
+        setPick[0] = k -> { pick[0] = k; name.setText(""); desc.setText(""); onPick.run(); fileRow.removeAllViews(); fileRow.addView(combo(labels, k, setPick[0]), lp(-1, -2, 1)); };
+        fileRow.addView(combo(labels, 0, setPick[0]), lp(-1, -2, 1));
+        onPick.run();
+        v.addView(row("File", fileRow));
+        gameInfo.setPadding(dp(4), dp(2), 0, 0);
+        v.addView(gameInfo);
+        v.addView(row("Name", name));
+        v.addView(row("Description", desc));
+        v.addView(row("Author", author));
+        LinearLayout updRow = hbox();
+        java.util.function.Consumer<Integer>[] setUpd = new java.util.function.Consumer[1];
+        setUpd[0] = k -> { upd[0] = k; updRow.removeAllViews(); updRow.addView(combo(mineCommunity.toArray(new String[0]), k, setUpd[0]), lp(-1, -2, 1)); };
+        updRow.addView(combo(mineCommunity.toArray(new String[0]), 0, setUpd[0]), lp(-1, -2, 1));
+        v.addView(row("Update of", updRow));
+        android.app.Dialog[] dl = new android.app.Dialog[1];
+        LinearLayout r = hbox();
+        r.addView(button("Cancel", false, x -> dl[0].dismiss(), false), lpm(0, -2, 1, 3));
+        r.addView(button("Submit for review", true, x -> {
+            File f = cands.get(pick[0]);
+            List<String> gs = Core.pluginGames(f);
+            String nm = name.getText().toString().trim(), ds = desc.getText().toString().trim().replaceAll("[\\r\\n]+", " "), au = author.getText().toString().trim();
+            if (gs.isEmpty()) { gameInfo.setText("⚠ add a \"// game: <package>\" line to the top of the file first"); return; }
+            if (nm.length() < 2 || au.isEmpty()) { gameInfo.setText("⚠ name and author are needed"); return; }
+            dev.vrfrida.Settings.prefs(this).edit().putString("storeAuthor", au).apply();
+            String updates = upd[0] == 0 ? "" : mineCommunity.get(upd[0]);
+            dl[0].dismiss();
+            setStatus("uploading " + f.getName() + "...");
+            new Thread(() -> {
+                try {
+                    String id = Store.submit(nm, gs.get(0), ds, au, updates, new String(Files.read(f), "UTF-8"));
+                    log("store: uploaded " + f.getName() + " for review, upload id " + id + ". It shows up in the store once it's approved");
+                    ui.post(() -> setStatus("uploaded (id " + id + "), waiting for review"));
+                } catch (Exception e) {
+                    log("store: upload failed: " + e.getMessage());
+                    ui.post(() -> setStatus("upload failed: " + e.getMessage()));
+                }
+            }).start();
+        }, false), lpm(0, -2, 1, 3));
+        dl[0] = themedDialog(v, r);
+        dl[0].show();
     }
 
     // ---------------------------------------------------------------- Menu Look tab

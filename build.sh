@@ -33,16 +33,20 @@ echo "== menu + bridge template"
 (cd "$MODS" && frida-compile UniversalMenu.ts -S -B iife -T none -o "$OLDPWD/$OUT/assets/menu.js")
 cp "$TOOLKIT_BRIDGE" "$OUT/assets/frida-il2cpp-bridge.js"
 cp assets/appsafety_spoof.js "$OUT/assets/appsafety_spoof.js"
-mkdir -p "$OUT/assets/patchkey" && cp patchkey/key.pk8 patchkey/cert.der "$OUT/assets/patchkey/"
+cp "$MODS/store/scan_rules.json" "$OUT/assets/scan_rules.json"   # store safety scan rules (the app also downloads newer ones)
+# patchkey/ is NOT bundled: the app makes / loads a per-device key (ApkPatch.keyDir)
 
 echo "== menu themes + backgrounds (runs the menu's own theme / background code in frida)"
 FRIDA_PY=$(head -1 "$(command -v frida)" | sed 's/^#!//; s/ .*//')
 "$FRIDA_PY" gen_menu_assets.py "$MODS/UniversalMenu.ts" "$OUT/assets/menu"
 
 echo "== seed files (unpacked to /sdcard/vrfrida on first run)"
-find "$MODS/imgui_plugins" -maxdepth 1 -type f \( -name '*.js' -o -name '*.txt' -o -name '*.png' \) -exec cp {} "$OUT/assets/seed/plugins/" \;
+# LEAN=1 (release.sh): public download, so no plugins / sounds inside; the headset gets them from vrfrida.py --sync
 cp "$MODS"/patterns/*.png "$OUT/assets/seed/patterns/" 2>/dev/null || true
-find "$MODS/sounds" -maxdepth 1 -type f -exec cp {} "$OUT/assets/seed/sounds/" \;
+if [ -z "${LEAN:-}" ]; then
+    find "$MODS/imgui_plugins" -maxdepth 1 -type f \( -name '*.js' -o -name '*.txt' -o -name '*.png' \) -exec cp {} "$OUT/assets/seed/plugins/" \;
+    find "$MODS/sounds" -maxdepth 1 -type f -exec cp {} "$OUT/assets/seed/sounds/" \;
+fi
 
 echo "== resources"
 "$BT/aapt2" compile --dir res -o "$OUT/res.zip"
@@ -54,10 +58,14 @@ echo "== java"
 # version + update repo: version.txt (bumped by release.sh), update_repo.txt (owner/repo, empty = no default)
 VERSION=$(cat version.txt 2>/dev/null || echo 1)
 UPDATE_REPO=$(cat update_repo.txt 2>/dev/null | tr -d '[:space:]' || true)
+# plugin store: store_repo.txt (owner/repo of universalmenu-store), uploads go to the chat_server Worker (CHAT_URL in the menu)
+STORE_REPO=$(cat store_repo.txt 2>/dev/null | tr -d '[:space:]' || true)
+STORE_UPLOAD=$(grep -oE '^const CHAT_URL *= *"[^"]*"' "$MODS/UniversalMenu.ts" | sed -E 's/.*"([^"]*)"/\1/')
 mkdir -p "$OUT/gen/dev/vrfrida"
 cat > "$OUT/gen/dev/vrfrida/BuildInfo.java" <<JAVA
 package dev.vrfrida;
-final class BuildInfo { static final String UPDATE_REPO = "$UPDATE_REPO"; static final int VERSION = $VERSION; }
+final class BuildInfo { static final String UPDATE_REPO = "$UPDATE_REPO"; static final int VERSION = $VERSION;
+    static final String STORE_REPO = "$STORE_REPO"; static final String STORE_UPLOAD = "$STORE_UPLOAD"; }
 JAVA
 # apksig (Google's apksigner library) signs patched games on the headset
 mkdir -p "$OUT/apksig" && (cd "$OUT/apksig" && unzip -qo "$BT/lib/apksigner.jar" 'com/android/apksig/*' && zip -qr ../apksig.jar com)
