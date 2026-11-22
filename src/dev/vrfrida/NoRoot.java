@@ -127,26 +127,35 @@ final class NoRoot {
         return "// vrfrida gadget loader\n" +
                 "(function () {\n" +
                 "  var PKG = " + q + ", DELAY = " + Math.max(0, delay) + ";\n" +
-                "  var self = Process.findModuleByName('" + GADGET + "');\n" +
-                "  var dir = self ? self.path.replace(/\\/[^\\/]*$/, '') : '';\n" +
+                // Frida cloaks its own module (findModuleByName(gadget) is always null), so take the folder from the game's
+                // own libs: they sit in the same lib dir as libfrida-gadget.so and libvrfrida-agent.js.so
+                // Gadget's console goes nowhere on Quest: the loader keeps its own log in the game's files folder
+                "  var LOG = '/storage/emulated/0/Android/data/' + PKG + '/files/vrfrida-loader.log', lines = [];\n" +
+                "  function log(m) { lines.push(new Date().toISOString() + '  ' + m); if (lines.length > 200) lines.shift(); try { File.writeAllText(LOG, lines.join('\\n') + '\\n'); } catch (e) {} try { console.log('[vrfrida] ' + m); } catch (e) {} }\n" +
+                "  log('loader started (frida ' + Frida.version + ', ' + Script.runtime + ')');\n" +
+                "  function libDir() {\n" +
+                "    var m = Process.findModuleByName('libmain.so') || Process.findModuleByName('libil2cpp.so') || Process.findModuleByName('" + GADGET + "');\n" +
+                "    return m ? m.path.replace(/\\/[^\\/]*$/, '') : '';\n" +
+                "  }\n" +
                 "  var paths = ['/storage/emulated/0/Android/data/' + PKG + '/files/frida/menu.js',\n" +
                 "               '/storage/emulated/0/vrfrida/agents/' + PKG + '.gadget.js',\n" +
-                "               dir + '/libvrfrida-agent.js.so'];\n" +
+                "               null];\n" +
                 "  function load() {\n" +
+                "    paths[2] = libDir() + '/libvrfrida-agent.js.so';\n" +
                 "    for (var i = 0; i < paths.length; i++) {\n" +
                 "      var src = null;\n" +
                 "      try { src = File.readAllText(paths[i]); } catch (e) { continue; }\n" +
                 "      if (!src || src.length < 100) continue;\n" +
-                "      console.log('[vrfrida] loading ' + paths[i]);\n" +
-                "      try { Script.evaluate(paths[i], src); } catch (e) { console.error('[vrfrida] ' + paths[i] + ': ' + (e.stack || e)); }\n" +
+                "      log('loading ' + paths[i] + ' (' + src.length + ' chars)');\n" +
+                "      try { Script.evaluate(paths[i], src); log('menu script started'); } catch (e) { log('ERROR in ' + paths[i] + ': ' + (e.stack || e)); }\n" +
                 "      return;\n" +
                 "    }\n" +
-                "    console.error('[vrfrida] no agent found in ' + paths.join(', '));\n" +
+                "    log('no agent found in ' + paths.join(', '));\n" +
                 "  }\n" +
                 "  var waited = 0;\n" +
                 "  (function poll() {\n" +
-                "    if (!Process.findModuleByName('libil2cpp.so')) { waited += 250; if (waited % 10000 === 0) console.log('[vrfrida] waiting for libil2cpp.so'); setTimeout(poll, 250); return; }\n" +
-                "    console.log('[vrfrida] libil2cpp.so loaded, menu in ' + DELAY + ' s');\n" +
+                "    if (!Process.findModuleByName('libil2cpp.so')) { waited += 250; if (waited % 10000 === 0) log('waiting for libil2cpp.so'); setTimeout(poll, 250); return; }\n" +
+                "    log('libil2cpp.so loaded, menu in ' + DELAY + ' s');\n" +
                 "    setTimeout(load, DELAY * 1000);\n" +
                 "  })();\n" +
                 "})();\n";
