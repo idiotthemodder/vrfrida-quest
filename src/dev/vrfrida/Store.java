@@ -102,7 +102,10 @@ final class Store {
     synchronized Installed installedOf(String id) { return installed.get(id); }
 
     // ---------------------------------------------------------------- network
-    static byte[] get(String url, long max) throws Exception {
+    static byte[] get(String url, long max) throws Exception { return get(url, max, null); }
+
+    /** progress gets the bytes read so far */
+    static byte[] get(String url, long max, java.util.function.LongConsumer progress) throws Exception {
         HttpURLConnection c = Updater.open(url);
         c.setRequestProperty("Accept", "*/*");
         c.setUseCaches(false);
@@ -114,6 +117,7 @@ final class Store {
             for (int n; (n = in.read(b)) > 0; ) {
                 o.write(b, 0, n);
                 if (o.size() > max) throw new Exception("file too big");
+                if (progress != null) progress.accept(o.size());
             }
             return o.toByteArray();
         }
@@ -180,11 +184,17 @@ final class Store {
         return null;
     }
 
+    volatile java.util.function.Consumer<Float> onProgress;   // 0..1 while downloading a plugin
+
     /** background thread: every file, sha256-checked against the index */
     Map<String, byte[]> download(Plugin p) throws Exception {
         Map<String, byte[]> out = new LinkedHashMap<>();
+        final long total = Math.max(1, p.size());
+        long[] before = {0};
         for (FileRef f : p.files) {
-            byte[] d = get(base() + f.path + "?v=" + p.version, MAX_FILE);
+            java.util.function.Consumer<Float> cb = onProgress;
+            byte[] d = get(base() + f.path + "?v=" + p.version, MAX_FILE, cb == null ? null : n -> cb.accept(Math.min(1f, (before[0] + n) / (float) total)));
+            before[0] += d.length;
             if (!sha256(d).equals(f.sha256)) throw new Exception(f.name + " doesn't match the index (the store is mid-update, try again in a few minutes)");
             out.put(f.name, d);
         }

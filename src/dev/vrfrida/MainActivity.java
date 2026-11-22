@@ -88,9 +88,29 @@ public class MainActivity extends Activity {
     Map<String, float[]> C;               // colors the widgets were built with
 
     final Runnable poll = new Runnable() {
-        @Override public void run() { refreshLogs(); ui.postDelayed(this, 1000); }
+        @Override public void run() { refreshLogs(); snapIfAsked(); ui.postDelayed(this, 1000); }
     };
     final Runnable saveGame = () -> flushSave();
+
+    /** dev: `adb shell touch /sdcard/vrfrida/.snap` -> the app draws ONLY its own window into /sdcard/vrfrida/snap.png
+     *  (a headset screenshot would include the passthrough camera; this can't) */
+    void snapIfAsked() {
+        File trig = new File(Paths.ROOT, ".snap");
+        if (!trig.exists()) return;
+        String want = "";
+        try { want = new String(Files.read(trig), "UTF-8").trim(); } catch (Exception ignored) {}
+        trig.delete();
+        if (want.matches("[0-4]") && Integer.parseInt(want) != tab) { goTab(Integer.parseInt(want)); ui.postDelayed(() -> { try { Files.write(trig, new byte[0]); } catch (Exception ignored) {} }, 1500); return; }
+        try {
+            View v = getWindow().getDecorView();
+            Bitmap b = Bitmap.createBitmap(v.getWidth(), v.getHeight(), Bitmap.Config.ARGB_8888);
+            v.draw(new Canvas(b));
+            try (java.io.FileOutputStream o = new java.io.FileOutputStream(new File(Paths.ROOT, "snap.png"))) { b.compress(Bitmap.CompressFormat.PNG, 100, o); }
+        } catch (Throwable e) {
+            log("snap failed: " + e);
+            try { Files.write(new File(Paths.ROOT, "snap.err"), android.util.Log.getStackTraceString(e).getBytes("UTF-8")); } catch (Exception ignored) {}
+        }
+    }
 
     // ================================================================ lifecycle
     @Override protected void onCreate(Bundle b) {
@@ -102,9 +122,8 @@ public class MainActivity extends Activity {
         look = new MenuLook(this);
         appLook = MenuCfg.parse(look, dev.vrfrida.Settings.prefs(this).getString("applook", "{}"));
         globalCfg = MenuCfg.parse(look, dev.vrfrida.Settings.globalLook(this));
-        if (!appLook.root.has("appTheme")) {
-            try { appLook.root.put("appTheme", MenuLook.GAME); } catch (Exception ignored) {}
-        }
+        String th = appLook.root.optString("appTheme", "auto");
+        if (!th.equals("meta") && !th.equals("uxpatcher")) { try { appLook.root.put("appTheme", "auto"); } catch (Exception ignored) {} }
         uxpKey = uxpSignature();
         rebuild();
         bg.execute(this::startup);
@@ -340,7 +359,7 @@ public class MainActivity extends Activity {
     }
 
     // ================================================================ which look is showing
-    String appTheme() { return appLook.root.optString("appTheme", MenuLook.GAME); }
+    String appTheme() { return appLook.root.optString("appTheme", "auto"); }   // auto | meta | uxpatcher
     boolean animateBg() { return appLook.root.optBoolean("animate", true); }
 
     /** the settings the window background follows: the synced look, or the selected game's while editing that */
@@ -349,15 +368,23 @@ public class MainActivity extends Activity {
         return globalCfg;
     }
 
-    String shownThemeId() {
-        if (MenuLook.UXPATCHER.equals(appTheme())) return MenuLook.UXPATCHER;
-        return shownCfg().str("theme");
-    }
+    String shownThemeId() { return shownCfg().str("theme"); }
 
-    Map<String, float[]> colorsNow() {
+    /** the menu's own colors (for the menu preview in the Menu Look tab only) */
+    Map<String, float[]> menuColorsNow() {
         double speed = shownCfg().root.optDouble("rainbowSpeed", 0.05);
         return look.colors(shownThemeId(), this, (float) speed);
     }
+
+    Map<String, Integer> S;               // Material 3 roles (M3.scheme): UXpatcher's colors, or Meta's
+
+    /** app colors: Material 3, from UXpatcher when it's installed (or chosen), else Meta blue */
+    Map<String, float[]> colorsNow() {
+        S = M3.scheme(this, appTheme());
+        return M3.legacy(S);
+    }
+
+    int m3(String role) { Integer c = S.get(role); return c == null ? 0xFFFF00FF : c; }
 
     int col(String key) { return MenuLook.argb(C.get(key)); }
     int col(String key, float alphaMul) { return MenuLook.argb(C.get(key), alphaMul); }
@@ -478,8 +505,8 @@ public class MainActivity extends Activity {
         repo.setTextSize(15);
         repo.setTextColor(col("Text"));
         repo.setHintTextColor(col("TextDisabled"));
-        repo.setBackground(rrKey("FrameBg"));
-        repo.setPadding(dp(12), dp(8), dp(12), dp(8));
+        repo.setBackground(rr(m3("surfaceContainerHighest"), 12));
+        repo.setPadding(dp(16), dp(12), dp(16), dp(12));
         repo.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
             @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
@@ -495,7 +522,9 @@ public class MainActivity extends Activity {
 
     void setBusy(boolean b) {
         busy = b;
-        for (View x : actions) { x.setEnabled(!b); x.setAlpha(b ? 0.45f : 1f); }
+        if (!b) progressValue = Float.NaN;
+        for (View x : actions) { x.setEnabled(!b); x.setAlpha(b ? 0.38f : 1f); }
+        showProgress();
     }
 
     // ================================================================ log
@@ -554,7 +583,7 @@ public class MainActivity extends Activity {
     // ================================================================ widgets in the menu's style
     int dp(float v) { return Math.round(v * getResources().getDisplayMetrics().density); }
 
-    float rounding() { return (float) shownCfg().num("rounding"); }
+    float rounding() { return 12f; }      // M3 medium shape
 
     GradientDrawable rr(int color, float radiusDp) {
         GradientDrawable d = new GradientDrawable();
@@ -563,15 +592,51 @@ public class MainActivity extends Activity {
         return d;
     }
 
-    GradientDrawable rrKey(String key) { return rr(col(key), Math.max(2, rounding() * 0.9f)); }
+    GradientDrawable rrKey(String key) { return rr(col(key), 12); }
+
+    /** pressed / hover feedback like M3 state layers */
+    Drawable ripple(Drawable content, int onColor) {
+        GradientDrawable mask = new GradientDrawable();
+        mask.setColor(0xFFFFFFFF);
+        if (content instanceof GradientDrawable) mask.setCornerRadii(null);
+        if (content instanceof GradientDrawable) { try { mask.setCornerRadius(((GradientDrawable) content).getCornerRadius()); } catch (Throwable ignored) {} }
+        return new android.graphics.drawable.RippleDrawable(ColorStateList.valueOf((onColor & 0x00FFFFFF) | 0x24000000), content, mask);
+    }
+
+    Typeface medium() { return Typeface.create("sans-serif-medium", Typeface.NORMAL); }
+
+    /** a Material icon from res/drawable/ic_<name>.xml, tinted */
+    Drawable icon(String name, int color, int sizeDp) {
+        int id = getResources().getIdentifier("ic_" + name, "drawable", getPackageName());
+        if (id == 0) return null;
+        Drawable d = getResources().getDrawable(id, getTheme()).mutate();
+        d.setTint(color);
+        d.setBounds(0, 0, dp(sizeDp), dp(sizeDp));
+        return d;
+    }
+
+    ImageView iconView(String name, int color, int sizeDp) {
+        ImageView v = new ImageView(this);
+        v.setImageDrawable(icon(name, color, sizeDp));
+        v.setScaleType(ImageView.ScaleType.CENTER);
+        return v;
+    }
+
+    /** M3 button with a leading 18dp icon in the button's text color */
+    <T extends TextView> T withIcon(T b, String name) {
+        Drawable d = icon(name, b.getCurrentTextColor(), 18);
+        b.setCompoundDrawablesRelative(d, null, null, null);
+        b.setCompoundDrawablePadding(dp(8));
+        b.setPadding(dp(16), b.getPaddingTop(), dp(20), b.getPaddingBottom());
+        return b;
+    }
 
     TextView text(CharSequence s, float sp, int color) {
         TextView t = new TextView(this);
         t.setText(s);
         t.setTextSize(sp);
         t.setTextColor(color);
-        int lum = (Color.red(color) * 299 + Color.green(color) * 587 + Color.blue(color) * 114) / 1000;
-        if (lum > 110) t.setShadowLayer(dp(2.5f), 0, dp(1), 0xB0000000);   // light text stays readable over bright backgrounds
+        t.setLineSpacing(0, 1.12f);
         return t;
     }
 
@@ -583,83 +648,166 @@ public class MainActivity extends Activity {
         return p;
     }
 
-    LinearLayout hbox() { LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.HORIZONTAL); l.setGravity(Gravity.CENTER_VERTICAL); return l; }
+    /** a horizontal row of buttons that stacks them (full width) when they don't fit side by side */
+    LinearLayout hbox() { return new AdaptiveRow(0); }
+
+    /**
+     * Horizontal LinearLayout that turns vertical when it gets narrow: minWidthPx > 0 = below that width,
+     * 0 = when its children's natural widths don't fit (only if they are all buttons; other rows never switch).
+     * Vertical mode gives every child the full width; switching back restores their layout params.
+     */
+    final class AdaptiveRow extends LinearLayout {
+        final int minWidthPx;
+        final Map<View, LinearLayout.LayoutParams> orig = new java.util.HashMap<>();
+        boolean vertical;
+        AdaptiveRow(int minWidthPx) { super(MainActivity.this); this.minWidthPx = minWidthPx; setOrientation(HORIZONTAL); setGravity(Gravity.CENTER_VERTICAL); }
+
+        @Override protected void onMeasure(int ws, int hs) {
+            int w = MeasureSpec.getSize(ws) - getPaddingLeft() - getPaddingRight();
+            boolean want = false;
+            if (MeasureSpec.getMode(ws) != MeasureSpec.UNSPECIFIED && getChildCount() > 1) {
+                if (minWidthPx > 0) want = w < minWidthPx;
+                else {
+                    int sum = 0;
+                    boolean allButtons = true;
+                    for (int i = 0; i < getChildCount(); i++) {
+                        View c = getChildAt(i);
+                        if (c.getVisibility() == GONE) continue;
+                        if (!"btn".equals(c.getTag())) { allButtons = false; break; }
+                        c.measure(MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED), MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
+                        LinearLayout.LayoutParams lp = orig.containsKey(c) ? orig.get(c) : (LinearLayout.LayoutParams) c.getLayoutParams();
+                        sum += c.getMeasuredWidth() + (lp == null ? 0 : lp.leftMargin + lp.rightMargin);
+                    }
+                    want = allButtons && sum > w;
+                }
+            }
+            if (want != vertical) apply(want);
+            super.onMeasure(ws, hs);
+        }
+
+        void apply(boolean v) {
+            vertical = v;
+            setOrientation(v ? VERTICAL : HORIZONTAL);
+            for (int i = 0; i < getChildCount(); i++) {
+                View c = getChildAt(i);
+                if (v) {
+                    LinearLayout.LayoutParams o = (LinearLayout.LayoutParams) c.getLayoutParams();
+                    if (o == null) o = new LinearLayout.LayoutParams(-2, -2);
+                    orig.put(c, o);
+                    LinearLayout.LayoutParams n = new LinearLayout.LayoutParams(-1, -2, 0);
+                    n.setMargins(o.leftMargin, Math.max(o.topMargin, dp(2)), o.rightMargin, Math.max(o.bottomMargin, dp(2)));
+                    c.setLayoutParams(n);
+                } else if (orig.containsKey(c)) c.setLayoutParams(orig.get(c));
+            }
+            if (!v) orig.clear();
+        }
+    }
     LinearLayout vbox() { LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL); return l; }
 
-    /** menu button: Button color, ButtonActive when primary (text in TextOnActive) */
+    /** M3 button: primary = filled (primary / onPrimary), otherwise tonal (secondaryContainer / onSecondaryContainer). pill shaped */
     TextView button(String label, boolean primary, View.OnClickListener l, boolean action) {
-        TextView b = text(label, 15, primary ? col("TextOnActive") : col("Text"));
+        int bg = primary ? m3("primary") : m3("secondaryContainer"), fg = primary ? m3("onPrimary") : m3("onSecondaryContainer");
+        TextView b = text(label, 14, fg);
         b.setGravity(Gravity.CENTER);
-        b.setPadding(dp(12), dp(9), dp(12), dp(9));
-        b.setBackground(rrKey(primary ? "ButtonActive" : "Button"));
+        b.setMinHeight(dp(40));
+        b.setPadding(dp(18), dp(8), dp(18), dp(8));
+        b.setTypeface(medium());
+        b.setLetterSpacing(0.01f);
+        b.setBackground(ripple(rr(bg, 20), fg));
         b.setOnClickListener(l);
         b.setClickable(true);
-        if (primary) b.setTypeface(Typeface.DEFAULT_BOLD);
-        if (action) { actions.add(b); if (busy) { b.setEnabled(false); b.setAlpha(0.45f); } }
+        b.setFocusable(true);
+        b.setSingleLine(true);
+        b.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        b.setTag("btn");
+        if (action) { actions.add(b); if (busy) { b.setEnabled(false); b.setAlpha(0.38f); } }
         return b;
     }
 
+    /** destructive action: filled error */
     TextView dangerButton(String label, View.OnClickListener l) {
         TextView b = button(label, false, l, true);
-        b.setBackground(rr(col("NotifError", 0.85f), Math.max(2, rounding() * 0.9f)));
-        b.setTextColor(Color.WHITE);
+        b.setBackground(ripple(rr(m3("errorContainer"), 20), m3("onErrorContainer")));
+        b.setTextColor(m3("onErrorContainer"));
         return b;
     }
 
-    /** section title like the menu's: accent text over a thin separator */
-    View section(String title) {
-        LinearLayout v = vbox();
-        TextView t = text(title, 15, col("TabActive"));
-        t.setTypeface(Typeface.DEFAULT_BOLD);
-        t.setPadding(dp(4), dp(12), 0, dp(3));
-        v.addView(t);
-        View line = new View(this);
-        line.setBackgroundColor(col("Separator"));
-        v.addView(line, lp(-1, dp(2), 0));
-        return v;
+    /** M3 outlined button */
+    TextView outlinedButton(String label, View.OnClickListener l, boolean action) {
+        TextView b = button(label, false, l, action);
+        GradientDrawable g = rr(0, 20);
+        g.setStroke(dp(1), m3("outline"));
+        b.setBackground(ripple(g, m3("primary")));
+        b.setTextColor(m3("primary"));
+        return b;
     }
 
-    /** a settings row: label on the left (42% like the menu), control on the right, RowBg behind */
+    /** M3 section header: title-small in primary */
+    View section(String title) {
+        TextView t = text(title, 14, m3("primary"));
+        t.setTypeface(medium());
+        t.setLetterSpacing(0.01f);
+        t.setPadding(dp(4), dp(20), 0, dp(6));
+        return t;
+    }
+
+    /** M3 list item: label on the left, control on the right, surfaceContainer card */
     LinearLayout row(String label, View control) {
-        LinearLayout r = hbox();
-        r.setBackground(rrKey("RowBg"));
-        r.setPadding(dp(10), dp(4), dp(8), dp(4));
-        r.setMinimumHeight(dp(40));
-        TextView l = text(label, 15, col("Text"));
-        r.addView(l, lp(0, -2, 0.42f));
-        r.addView(control, lp(0, -2, 0.58f));
+        LinearLayout r = new AdaptiveRow(dp(520));
+        r.setBackground(rr(m3("surfaceContainer"), 12));
+        r.setPadding(dp(16), dp(6), dp(12), dp(6));
+        r.setMinimumHeight(dp(56));
+        TextView l = text(label, 15, m3("onSurface"));
+        r.addView(l, lp(0, -2, 0.40f));
+        r.addView(control, lp(0, -2, 0.60f));
         LinearLayout.LayoutParams p = lp(-1, -2, 0);
-        p.setMargins(0, dp(2), 0, 0);
+        p.setMargins(0, dp(3), 0, 0);
         r.setLayoutParams(p);
         return r;
     }
 
-    /** checkbox: FrameBg square, Check-colored tick, description in TextDisabled */
+    /** M3 switch (52 x 32 track, thumb grows when on), description after it */
     View checkbox(boolean on, String desc, java.util.function.Consumer<Boolean> set) {
         LinearLayout box = hbox();
         final boolean[] v = {on};
-        View sq = new View(this) {
+        final float[] anim = {on ? 1f : 0f};
+        View sw = new View(this) {
             final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
             @Override protected void onDraw(Canvas c) {
-                if (!v[0]) return;
-                p.setColor(col("Check"));
-                p.setStyle(Paint.Style.STROKE);
-                p.setStrokeWidth(getWidth() * 0.13f);
-                p.setStrokeCap(Paint.Cap.ROUND);
-                Path t = new Path();
-                float w = getWidth(), h = getHeight();
-                t.moveTo(w * 0.22f, h * 0.52f); t.lineTo(w * 0.42f, h * 0.72f); t.lineTo(w * 0.78f, h * 0.3f);
-                c.drawPath(t, p);
+                float w = getWidth(), h = getHeight(), k = anim[0];
+                float target = v[0] ? 1f : 0f;
+                if (Math.abs(target - k) > 0.01f) { anim[0] += (target - k) * 0.35f; postInvalidateOnAnimation(); } else anim[0] = target;
+                k = anim[0];
+                android.graphics.RectF track = new android.graphics.RectF(dp(1), dp(1), w - dp(1), h - dp(1));
+                p.setStyle(Paint.Style.FILL);
+                p.setColor(M3.mix(m3("surfaceContainerHighest"), m3("primary"), k));
+                c.drawRoundRect(track, h / 2, h / 2, p);
+                if (k < 0.99f) {
+                    p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(dp(2));
+                    p.setColor((m3("outline") & 0x00FFFFFF) | ((int) (255 * (1 - k)) << 24));
+                    c.drawRoundRect(track, h / 2, h / 2, p);
+                }
+                float r = dp(8) + dp(4) * k, cx = h / 2 + (w - h) * k;
+                p.setStyle(Paint.Style.FILL);
+                p.setColor(M3.mix(m3("outline"), m3("onPrimary"), k));
+                c.drawCircle(cx, h / 2, r, p);
+                if (k > 0.5f) {   // check mark on the thumb
+                    p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(dp(2)); p.setStrokeCap(Paint.Cap.ROUND);
+                    p.setColor(m3("primary"));
+                    Path t = new Path();
+                    t.moveTo(cx - dp(4.5f), h / 2); t.lineTo(cx - dp(1.2f), h / 2 + dp(3.2f)); t.lineTo(cx + dp(4.8f), h / 2 - dp(3.5f));
+                    c.drawPath(t, p);
+                }
             }
         };
-        sq.setBackground(rrKey("FrameBg"));
-        box.addView(sq, new LinearLayout.LayoutParams(dp(26), dp(26)));
+        box.addView(sw, new LinearLayout.LayoutParams(dp(52), dp(32)));
         if (desc != null) {
-            TextView d = text(desc, 13, col("TextDisabled"));
-            d.setPadding(dp(10), 0, 0, 0);
+            TextView d = text(desc, 13, m3("onSurfaceVariant"));
+            d.setPadding(dp(14), 0, 0, 0);
             box.addView(d, lp(0, -2, 1));
         }
-        box.setOnClickListener(x -> { v[0] = !v[0]; sq.invalidate(); set.accept(v[0]); });
+        box.setBackground(ripple(rr(0, 16), m3("onSurface")));
+        box.setOnClickListener(x -> { v[0] = !v[0]; sw.invalidate(); set.accept(v[0]); });
         return box;
     }
 
@@ -670,9 +818,9 @@ public class MainActivity extends Activity {
         int steps = decimals == 0 ? (int) Math.round(max - min) : (int) Math.round((max - min) * Math.pow(10, decimals));
         sb.setMax(Math.max(1, steps));
         sb.setProgress((int) Math.round((value - min) / (max - min) * sb.getMax()));
-        sb.setProgressTintList(ColorStateList.valueOf(col("SliderFill")));
-        sb.setProgressBackgroundTintList(ColorStateList.valueOf(col("FrameBg")));
-        sb.setThumbTintList(ColorStateList.valueOf(col("SliderGrab")));
+        sb.setProgressTintList(ColorStateList.valueOf(m3("primary")));
+        sb.setProgressBackgroundTintList(ColorStateList.valueOf(m3("secondaryContainer")));
+        sb.setThumbTintList(ColorStateList.valueOf(m3("primary")));
         TextView val = text(fmt(value, decimals), 14, col("Text"));
         val.setGravity(Gravity.END);
         box.addView(sb, lp(0, -2, 1));
@@ -695,23 +843,23 @@ public class MainActivity extends Activity {
 
     /** combo: FrameBg box with the value, opens a PopupBg list */
     View combo(String[] labels, int index, java.util.function.Consumer<Integer> set) {
-        TextView t = text((index >= 0 && index < labels.length ? labels[index] : "?") + "   ▾", 15, col("Text"));
-        t.setBackground(rrKey("FrameBg"));
-        t.setPadding(dp(12), dp(8), dp(12), dp(8));
+        TextView t = text((index >= 0 && index < labels.length ? labels[index] : "?") + "   ▾", 15, m3("onSurface"));
+        t.setBackground(ripple(rr(m3("surfaceContainerHighest"), 12), m3("onSurface")));
+        t.setPadding(dp(16), dp(10), dp(14), dp(10));
         t.setOnClickListener(anchor -> {
             LinearLayout list = vbox();
             list.setPadding(dp(4), dp(4), dp(4), dp(4));
             ScrollView sv = new ScrollView(this);
             sv.addView(list);
-            sv.setBackground(rr(MenuLook.argb(MenuLook.a(C.get("PopupBg"), 1)), Math.max(2, rounding() * 0.9f)));
+            sv.setBackground(rr(m3("surfaceContainer"), 12));
             PopupWindow pw = new PopupWindow(sv, Math.max(anchor.getWidth(), dp(220)), Math.min(dp(44) * labels.length + dp(12), dp(420)), true);
             pw.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
             pw.setElevation(dp(8));
             for (int i = 0; i < labels.length; i++) {
                 final int k = i;
-                TextView o = text(labels[i], 15, i == index ? col("TextOnActive") : col("Text"));
-                o.setPadding(dp(12), dp(10), dp(12), dp(10));
-                if (i == index) o.setBackground(rrKey("TabActive"));
+                TextView o = text(labels[i], 15, i == index ? m3("onSecondaryContainer") : m3("onSurface"));
+                o.setPadding(dp(16), dp(12), dp(16), dp(12));
+                o.setBackground(ripple(rr(i == index ? m3("secondaryContainer") : 0, 8), m3("onSurface")));
                 o.setOnClickListener(x -> { pw.dismiss(); set.accept(k); });
                 list.addView(o, lp(-1, -2, 0));
             }
@@ -728,30 +876,25 @@ public class MainActivity extends Activity {
         logView = null; miniLog = null; gameList = null; detailHeader = null;
         logSig = "";
 
-        FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(MenuLook.argb(MenuLook.a(MenuLook.darker(C.get("WindowBg"), 0.55f), 1)));
-        int m = dp(10);
-        MenuBgView win = new MenuBgView(this, look, new MenuBgView.Source() {
-            @Override public MenuCfg cfg() { return shownCfg(); }
-            @Override public Map<String, float[]> colors() { return look.animated(shownThemeId()) ? colorsNow() : C; }
-            @Override public boolean animate() { return animateBg(); }
-        });
-        FrameLayout.LayoutParams wp = new FrameLayout.LayoutParams(-1, -1);
-        wp.setMargins(m, m, m, m);
-        root.addView(win, wp);
+        LinearLayout root = hbox();
+        root.setGravity(Gravity.TOP);
+        root.setBackgroundColor(m3("surface"));
+        root.addView(navRail(), lp(dp(96), -1, 0));
 
         LinearLayout content = vbox();
         content.addView(titleBar());
-        content.addView(tabBar());
+        topProgress = new LinearProgress();
+        content.addView(topProgress, lp(-1, dp(4), 0));
+        showProgress();
         tabScroll = new ScrollView(this);
         tabScroll.setFillViewport(true);
         tabScroll.setVerticalScrollBarEnabled(true);
         View body = tab == 0 ? gamesTab() : tab == 1 ? pluginsTab() : tab == 2 ? storeTab() : tab == 3 ? lookTab() : logTab();
         tabScroll.addView(body);
-        tabScroll.setPadding(dp(10), dp(6), dp(10), dp(10));
+        tabScroll.setPadding(dp(16), dp(8), dp(20), dp(16));
         tabScroll.setClipToPadding(false);
         content.addView(tabScroll, lp(-1, 0, 1));
-        root.addView(content, wp);
+        root.addView(content, lp(0, -1, 1));
         setContentView(root);
         final int y = scrollY[tab];
         tabScroll.post(() -> tabScroll.scrollTo(0, y));
@@ -761,14 +904,10 @@ public class MainActivity extends Activity {
 
     Bitmap logo;
 
+    /** M3 top app bar: title, status as supporting text, Refresh */
     View titleBar() {
         LinearLayout t = hbox();
-        float r = dp(Math.max(2, rounding() * 1.8f));
-        GradientDrawable d = new GradientDrawable();
-        d.setColor(col("TitleBgActive"));
-        d.setCornerRadii(new float[]{r, r, r, r, 0, 0, 0, 0});
-        t.setBackground(d);
-        t.setPadding(dp(12), dp(6), dp(8), dp(6));
+        t.setPadding(dp(16), dp(12), dp(16), dp(8));
         if (logo == null) {
             File f = new File(Paths.PLUGINS, "rift_menu_logo.png");
             if (f.isFile()) logo = BitmapFactory.decodeFile(f.getPath());
@@ -776,43 +915,112 @@ public class MainActivity extends Activity {
         if (logo != null) {
             ImageView iv = new ImageView(this);
             iv.setImageBitmap(logo);
-            t.addView(iv, new LinearLayout.LayoutParams(dp(30), dp(30)));
+            iv.setPadding(0, 0, dp(12), 0);
+            t.addView(iv, new LinearLayout.LayoutParams(dp(44), dp(32)));
         }
-        TextView name = text("vrfrida", 19, col("Text"));
-        name.setTypeface(Typeface.DEFAULT_BOLD);
-        name.setPadding(dp(8), 0, dp(12), 0);
-        t.addView(name);
-        statusView = text(status, 13, col("TextDisabled"));
+        LinearLayout tt = vbox();
+        TextView name = text(TABS[tab], 22, m3("onSurface"));
+        tt.addView(name);
+        statusView = text(status, 13, m3("onSurfaceVariant"));
         statusView.setSingleLine(true);
         statusView.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        t.addView(statusView, lp(0, -2, 1));
+        tt.addView(statusView);
+        t.addView(tt, lp(0, -2, 1));
         // Refresh also picks up a new PC sync (logo, patterns, plugins) without restarting the app
-        t.addView(button("Refresh", false, v -> {
+        t.addView(withIcon(outlinedButton("Refresh", v -> {
             logo = null; look.bitmaps.clear();
             io.execute(this::scanGames);
-        }, false));
+            if (tab == 2) loadStore();
+        }, false), "refresh"));
         return t;
     }
 
-    View tabBar() {
-        LinearLayout v = vbox();
-        v.setPadding(dp(10), dp(8), dp(10), 0);
-        LinearLayout bar = hbox();
+    static final String[] TAB_ICONS = {"games", "extension", "store", "palette", "article"};
+
+    /** M3 navigation rail: icon in a pill indicator, label under it */
+    View navRail() {
+        LinearLayout rail = vbox();
+        rail.setGravity(Gravity.CENTER_HORIZONTAL);
+        rail.setBackgroundColor(m3("surfaceContainer"));
+        rail.setPadding(0, dp(14), 0, dp(14));
+        TextView brand = text("vrfrida", 13, m3("primary"));
+        brand.setTypeface(medium());
+        brand.setGravity(Gravity.CENTER);
+        rail.addView(brand, lp(-1, -2, 0));
+        View sp = new View(this);
+        rail.addView(sp, lp(1, dp(18), 0));
         for (int i = 0; i < TABS.length; i++) {
             final int k = i;
-            TextView t = text(i == 2 && storeWaiting > 0 ? TABS[i] + " (" + storeWaiting + ")" : TABS[i], 15, i == tab ? col("TextOnActive") : col("Text"));
-            t.setGravity(Gravity.CENTER);
-            t.setPadding(0, dp(9), 0, dp(9));
-            t.setBackground(rrKey(i == tab ? "TabActive" : "Tab"));
-            if (i == tab) t.setTypeface(Typeface.DEFAULT_BOLD);
-            t.setOnClickListener(x -> goTab(k));
-            bar.addView(t, lpm(0, -2, 1, 2));
+            boolean on = i == tab;
+            LinearLayout item = vbox();
+            item.setGravity(Gravity.CENTER_HORIZONTAL);
+            item.setPadding(0, dp(6), 0, dp(10));
+            FrameLayout pill = new FrameLayout(this);
+            pill.setBackground(ripple(rr(on ? m3("secondaryContainer") : 0, 16), m3("onSurface")));
+            ImageView ic = iconView(TAB_ICONS[i], on ? m3("onSecondaryContainer") : m3("onSurfaceVariant"), 24);
+            pill.addView(ic, new FrameLayout.LayoutParams(-1, -1));
+            if (i == 2 && storeWaiting > 0) {
+                TextView b = text(String.valueOf(storeWaiting), 10, m3("onError"));
+                b.setGravity(Gravity.CENTER);
+                b.setTypeface(medium());
+                b.setBackground(rr(m3("error"), 8));
+                FrameLayout.LayoutParams bp = new FrameLayout.LayoutParams(dp(16), dp(16), Gravity.TOP | Gravity.END);
+                bp.setMargins(0, dp(1), dp(8), 0);
+                pill.addView(b, bp);
+            }
+            item.addView(pill, new LinearLayout.LayoutParams(dp(56), dp(32)));
+            TextView lb = text(TABS[i], 12, on ? m3("onSurface") : m3("onSurfaceVariant"));
+            lb.setGravity(Gravity.CENTER);
+            if (on) lb.setTypeface(medium());
+            lb.setPadding(0, dp(4), 0, 0);
+            item.addView(lb, lp(-1, -2, 0));
+            item.setOnClickListener(x -> goTab(k));
+            pill.setOnClickListener(x -> goTab(k));
+            rail.addView(item, lp(-1, -2, 0));
         }
-        v.addView(bar);
-        View line = new View(this);
-        line.setBackgroundColor(col("TabActive"));
-        v.addView(line, lp(-1, dp(3), 0));
-        return v;
+        return rail;
+    }
+
+    // ---------------------------------------------------------------- progress (M3 linear progress indicator)
+    LinearProgress topProgress;
+    volatile float progressValue = Float.NaN;   // NaN = none, < 0 = indeterminate, 0..1 = determinate
+
+    /** show the top bar: <0 indeterminate, 0..1 done fraction, NaN = only while busy / loading */
+    void progress(float p) { progressValue = p; ui.post(this::showProgress); }
+
+    void showProgress() {
+        if (topProgress == null) return;
+        float p = progressValue;
+        if (Float.isNaN(p) && (busy || storeLoading)) p = -1;
+        topProgress.set(p);
+    }
+
+    final class LinearProgress extends View {
+        float value = Float.NaN;
+        final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final long t0 = System.currentTimeMillis();
+        LinearProgress() { super(MainActivity.this); }
+        void set(float v) { value = v; setVisibility(Float.isNaN(v) ? View.INVISIBLE : View.VISIBLE); invalidate(); }
+        @Override protected void onDraw(Canvas c) {
+            if (Float.isNaN(value)) return;
+            float w = getWidth(), h = getHeight(), r = h / 2, gap = dp(4);
+            paint.setColor(m3("secondaryContainer"));
+            if (value >= 0) {
+                float x = Math.max(h, w * Math.min(1, value));
+                paint.setColor(m3("primary"));
+                c.drawRoundRect(0, 0, x, h, r, r, paint);
+                paint.setColor(m3("secondaryContainer"));
+                if (x + gap < w) c.drawRoundRect(x + gap, 0, w, h, r, r, paint);
+            } else {
+                // indeterminate: a bar that grows / slides across, track in the gaps
+                float t = ((System.currentTimeMillis() - t0) % 1800) / 1800f;
+                float a = w * (float) Math.max(0, Math.min(1, (t - 0.0) * 1.6 - 0.3)), b = w * (float) Math.min(1, t * 1.6);
+                c.drawRoundRect(0, 0, w, h, r, r, paint);
+                paint.setColor(m3("primary"));
+                if (b - a > h) c.drawRoundRect(a, 0, b, h, r, r, paint);
+                postInvalidateOnAnimation();
+            }
+        }
     }
 
     void goTab(int k) {
@@ -825,7 +1033,7 @@ public class MainActivity extends Activity {
 
     // ---------------------------------------------------------------- Games tab
     View gamesTab() {
-        LinearLayout split = hbox();
+        LinearLayout split = new AdaptiveRow(dp(760));
         split.setGravity(Gravity.TOP);
         LinearLayout left = vbox();
         EditText q = new EditText(this);
@@ -835,8 +1043,8 @@ public class MainActivity extends Activity {
         q.setTextSize(15);
         q.setTextColor(col("Text"));
         q.setHintTextColor(col("TextDisabled"));
-        q.setBackground(rrKey("FrameBg"));
-        q.setPadding(dp(12), dp(8), dp(12), dp(8));
+        q.setBackground(rr(m3("surfaceContainerHighest"), 12));
+        q.setPadding(dp(16), dp(12), dp(16), dp(12));
         q.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
             @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
@@ -848,7 +1056,7 @@ public class MainActivity extends Activity {
         fillGameList();
         split.addView(left, lpm(0, -2, 0.9f, 0));
         View gap = new View(this);
-        split.addView(gap, lp(dp(10), 1, 0));
+        split.addView(gap, lp(dp(12), dp(12), 0));
         split.addView(gameDetail(), lp(0, -2, 1.6f));
         return split;
     }
@@ -872,23 +1080,28 @@ public class MainActivity extends Activity {
     View gameRow(Game g) {
         boolean s = g == sel;
         LinearLayout r = hbox();
-        r.setBackground(rrKey(s ? "TabActive" : "RowBg"));
-        r.setPadding(dp(8), dp(6), dp(4), dp(6));
+        int onBg = s ? m3("onSecondaryContainer") : m3("onSurface");
+        r.setBackground(ripple(rr(s ? m3("secondaryContainer") : m3("surfaceContainerLow"), 16), onBg));
+        r.setPadding(dp(12), dp(8), dp(4), dp(8));
         ImageView icon = new ImageView(this);
         if (g.icon != null) icon.setImageBitmap(g.icon);
-        r.addView(icon, new LinearLayout.LayoutParams(dp(38), dp(38)));
+        icon.setClipToOutline(true);
+        icon.setBackground(rr(0xFF000000, 10));
+        r.addView(icon, new LinearLayout.LayoutParams(dp(40), dp(40)));
         LinearLayout col = vbox();
-        col.setPadding(dp(10), 0, 0, 0);
-        TextView name = text(g.label, 15, s ? col("TextOnActive") : col("Text"));
+        col.setPadding(dp(12), 0, 0, 0);
+        TextView name = text(g.label, 15, onBg);
+        name.setTypeface(medium());
         name.setSingleLine(true);
         name.setEllipsize(android.text.TextUtils.TruncateAt.END);
         col.addView(name);
-        String st = g.injected ? "menu loaded" : g.running ? "running" : g.patched ? "patched (no root)" + (rootOk ? "" : "  ·  bridge " + g.bridge) : "bridge " + g.bridge;
-        int sc = s ? col("TextOnActive", 0.8f) : g.injected ? col("TabActive") : g.running || g.bridge.equals("fresh") ? col("TextDisabled") : col("NotifWarn");
+        String st = g.injected ? "● menu loaded" : g.running ? "running" : g.patched ? "patched (no root)" + (rootOk ? "" : "  ·  bridge " + g.bridge) : "bridge " + g.bridge;
+        int sc = g.injected ? m3("success") : s ? M3.mix(onBg, m3("secondaryContainer"), 0.25) : g.running || g.bridge.equals("fresh") || g.patched ? m3("onSurfaceVariant") : m3("warning");
         col.addView(text(st, 12, sc));
         r.addView(col, lp(0, -2, 1));
-        TextView star = text(g.fav ? "★" : "☆", 22, g.fav ? col("Check") : (s ? col("TextOnActive", 0.7f) : col("TextDisabled")));
-        star.setPadding(dp(8), 0, dp(8), 0);
+        ImageView star = iconView(g.fav ? "star" : "star_border", g.fav ? m3("warning") : m3("onSurfaceVariant"), 22);
+        star.setPadding(dp(10), dp(8), dp(10), dp(8));
+        star.setBackground(ripple(rr(0, 20), m3("onSurface")));
         star.setOnClickListener(v -> {
             g.fav = !g.fav;
             dev.vrfrida.Settings.setFavorite(this, g.ai.packageName, g.fav);
@@ -898,7 +1111,7 @@ public class MainActivity extends Activity {
         r.addView(star);
         r.setOnClickListener(v -> select(g));
         LinearLayout.LayoutParams p = lp(-1, -2, 0);
-        p.setMargins(0, dp(2), 0, dp(2));
+        p.setMargins(0, dp(3), 0, dp(3));
         r.setLayoutParams(p);
         return r;
     }
@@ -916,22 +1129,21 @@ public class MainActivity extends Activity {
     View gameDetail() {
         LinearLayout d = vbox();
         if (sel == null) { d.addView(text("pick a game", 15, col("TextDisabled"))); return d; }
-        TextView t = text(sel.label, 21, col("Text"));
-        t.setTypeface(Typeface.DEFAULT_BOLD);
+        TextView t = text(sel.label, 24, m3("onSurface"));
         d.addView(t);
-        detailHeader = text(detailLine(sel), 13, col("TextDisabled"));
+        detailHeader = text(detailLine(sel), 13, m3("onSurfaceVariant"));
         d.addView(detailHeader);
 
         LinearLayout r1 = hbox();
         r1.setPadding(0, dp(8), 0, 0);
-        r1.addView(button("Launch + inject", true, v -> launchAndInject(), true), lpm(0, -2, 1.4f, 3));
-        r1.addView(button("Inject now", false, v -> injectNow(), true), lpm(0, -2, 1, 3));
-        r1.addView(dangerButton("Unload menu", v -> job("unload", g -> core.stopInjector(g.ai.packageName, true))), lpm(0, -2, 1, 3));
+        r1.addView(withIcon(button("Launch + inject", true, v -> launchAndInject(), true), "play"), lpm(0, -2, 1.4f, 3));
+        r1.addView(withIcon(button("Inject now", false, v -> injectNow(), true), "bolt"), lpm(0, -2, 1, 3));
+        r1.addView(withIcon(dangerButton("Unload menu", v -> job("unload", g -> core.stopInjector(g.ai.packageName, true))), "stop"), lpm(0, -2, 1, 3));
         d.addView(r1);
         LinearLayout r2 = hbox();
         r2.addView(button("Plugins ›", false, v -> goTab(1), false), lpm(0, -2, 1, 3));
         r2.addView(button("Menu look ›", false, v -> { lookScope = cfg.followGlobal ? 0 : 1; goTab(3); }, false), lpm(0, -2, 1, 3));
-        r2.addView(button("Rebuild bridge", false, v -> job("rebuild bridge", g -> Bridge.ensure(this, g.ai, true, this::log)), true), lpm(0, -2, 1, 3));
+        r2.addView(withIcon(button("Rebuild bridge", false, v -> job("rebuild bridge", g -> Bridge.ensure(this, g.ai, true, this::log)), true), "build"), lpm(0, -2, 1, 3));
         d.addView(r2);
 
         if (!rootOk) {
@@ -941,8 +1153,8 @@ public class MainActivity extends Activity {
         }
         d.addView(section("No root (Frida Gadget)"));
         LinearLayout r3 = hbox();
-        r3.addView(button(sel.patched ? "Repatch + update" : "Patch + install", !rootOk, v -> patchAndInstall(), true), lpm(0, -2, 1.4f, 3));
-        r3.addView(button("Update mods", false, v -> job("update mods (no root)", g -> noRoot.updateAgent(core, g.ai, cfg), false), true), lpm(0, -2, 1, 3));
+        r3.addView(withIcon(button(sel.patched ? "Repatch + update" : "Patch + install", !rootOk, v -> patchAndInstall(), true), "build"), lpm(0, -2, 1.4f, 3));
+        r3.addView(withIcon(button("Update mods", false, v -> job("update mods (no root)", g -> noRoot.updateAgent(core, g.ai, cfg), false), true), "sync"), lpm(0, -2, 1, 3));
         d.addView(r3);
         TextView nr = text(sel.patched
                 ? "Patched: the menu starts by itself in this game. Repatch after changing plugins / menu or after a store update (installs as an update, keeps game data)."
@@ -962,7 +1174,7 @@ public class MainActivity extends Activity {
         d.addView(section("Log"));
         miniLog = text("", 12, col("Text"));
         miniLog.setTypeface(Typeface.MONOSPACE);
-        miniLog.setBackground(rrKey("FrameBg"));
+        miniLog.setBackground(rr(m3("surfaceContainerLowest"), 12));
         miniLog.setPadding(dp(10), dp(8), dp(10), dp(8));
         miniLog.setOnClickListener(v -> goTab(4));
         LinearLayout.LayoutParams lp = lp(-1, -2, 0);
@@ -996,10 +1208,10 @@ public class MainActivity extends Activity {
         int on = 0;
         for (File f : mine) if (!cfg.disabledPlugins.contains(f.getName())) on++;
 
+        TextView t = text(sel.label, 20, m3("onSurface"));
+        d.addView(t);
         LinearLayout head = hbox();
-        TextView t = text(sel.label + "  ·  plugins", 19, col("Text"));
-        t.setTypeface(Typeface.DEFAULT_BOLD);
-        head.addView(t, lp(0, -2, 1));
+        head.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         head.addView(button("All on", false, v -> { cfg.disabledPlugins.clear(); cfg.save(this, pkg); rebuild(); }, false), lpm(-2, -2, 0, 3));
         head.addView(button("All off", false, v -> { for (File f : mine) cfg.disabledPlugins.add(f.getName()); cfg.save(this, pkg); rebuild(); }, false), lpm(-2, -2, 0, 3));
         d.addView(head);
@@ -1051,37 +1263,44 @@ public class MainActivity extends Activity {
     void loadStore() {
         if (storeLoading) return;
         storeLoading = true;
+        showProgress();
         new Thread(() -> {
             store.refresh();
             int w = store.updates(false).size();
-            ui.post(() -> { storeLoading = false; storeWaiting = w; if (tab == 2) rebuild(); });
+            ui.post(() -> { storeLoading = false; storeWaiting = w; showProgress(); if (tab == 2) rebuild(); });
         }).start();
     }
 
     int sevColor(String sev) { return sev.equals("high") ? col("NotifError") : sev.equals("medium") ? col("NotifWarn") : col("TextDisabled"); }
 
-    TextView badge(String s, int color) {
-        TextView b = text(s, 11, Color.WHITE);
-        b.setTypeface(Typeface.DEFAULT_BOLD);
-        b.setPadding(dp(7), dp(2), dp(7), dp(2));
-        b.setBackground(rr(color, 6));
+    /** M3 label chip: container color + on-container text */
+    TextView badge(String s, String container, String on) { return badge(s, container, on, null); }
+
+    TextView badge(String s, String container, String on, String iconName) {
+        TextView b = text(s, 11, m3(on));
+        if (iconName != null) { b.setCompoundDrawablesRelative(icon(iconName, m3(on), 14), null, null, null); b.setCompoundDrawablePadding(dp(4)); b.setGravity(Gravity.CENTER_VERTICAL); }
+        b.setTypeface(medium());
+        b.setLetterSpacing(0.04f);
+        b.setPadding(dp(8), dp(3), dp(8), dp(3));
+        b.setBackground(rr(m3(container), 8));
         return b;
     }
 
     View storeTab() {
         LinearLayout d = vbox();
         LinearLayout head = hbox();
-        TextView t = text("Plugin store", 19, col("Text"));
-        t.setTypeface(Typeface.DEFAULT_BOLD);
-        head.addView(t, lp(0, -2, 1));
-        head.addView(button(storeLoading ? "Loading..." : "Refresh", false, v -> loadStore(), false), lpm(-2, -2, 0, 3));
-        head.addView(button("Upload a plugin", false, v -> uploadDialog(), false), lpm(-2, -2, 0, 3));
+        head.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        head.addView(withIcon(button(storeLoading ? "Loading..." : "Refresh list", false, v -> loadStore(), false), "sync"), lpm(-2, -2, 0, 3));
+        head.addView(withIcon(button("Upload a plugin", false, v -> uploadDialog(), false), "upload"), lpm(-2, -2, 0, 3));
         d.addView(head);
 
         List<Store.Plugin> idx = store.index;
         if (idx == null || System.currentTimeMillis() - store.indexAt > 10 * 60_000L) loadStore();
         if (idx == null) {
-            d.addView(text(store.error.isEmpty() ? "loading the plugin list from github.com/" + Store.repo(this) + " ..." : "couldn't load the store: " + store.error, 14, col("TextDisabled")));
+            TextView l = text(store.error.isEmpty() ? "Loading plugins from github.com/" + Store.repo(this) + "..." : "Couldn't load the store: " + store.error, 14, store.error.isEmpty() ? m3("onSurfaceVariant") : m3("error"));
+            l.setPadding(dp(4), dp(16), 0, dp(10));
+            d.addView(l);
+            if (store.error.isEmpty()) { LinearProgress lpb = new LinearProgress(); lpb.set(-1); d.addView(lpb, lp(-1, dp(4), 0)); }
             return d;
         }
         String[] filters = {sel != null ? "For " + sel.label : "For the selected game", "All games"};
@@ -1107,22 +1326,22 @@ public class MainActivity extends Activity {
 
     View pluginCard(Store.Plugin p) {
         LinearLayout c = vbox();
-        c.setBackground(rrKey("RowBg"));
-        c.setPadding(dp(12), dp(8), dp(10), dp(8));
+        c.setBackground(rr(m3("surfaceContainerLow"), 16));
+        c.setPadding(dp(16), dp(14), dp(14), dp(12));
         LinearLayout.LayoutParams cp = lp(-1, -2, 0);
-        cp.setMargins(0, dp(4), 0, 0);
+        cp.setMargins(0, dp(6), 0, 0);
         c.setLayoutParams(cp);
         Store.Installed inst = store.installedOf(p.id);
         boolean hasUpdate = inst != null && !inst.version.equals(p.version);
 
         LinearLayout top = hbox();
-        TextView n = text(p.name, 16, col("Text"));
-        n.setTypeface(Typeface.DEFAULT_BOLD);
+        TextView n = text(p.name, 17, m3("onSurface"));
+        n.setTypeface(medium());
         top.addView(n);
         LinearLayout.LayoutParams bp = lp(-2, -2, 0);
         bp.setMargins(dp(8), 0, 0, 0);
-        top.addView(p.trusted ? badge("OFFICIAL", col("NotifSuccess")) : badge("COMMUNITY · UNTRUSTED", col("NotifError")), bp);
-        if (inst != null) { LinearLayout.LayoutParams ip = lp(-2, -2, 0); ip.setMargins(dp(6), 0, 0, 0); top.addView(badge(hasUpdate ? "UPDATE" : "INSTALLED", col("TabActive")), ip); }
+        top.addView(p.trusted ? badge("OFFICIAL", "successContainer", "onSuccessContainer", "check") : badge("COMMUNITY · UNTRUSTED", "errorContainer", "onErrorContainer", "warning"), bp);
+        if (inst != null) { LinearLayout.LayoutParams ip = lp(-2, -2, 0); ip.setMargins(dp(6), 0, 0, 0); top.addView(badge(hasUpdate ? "UPDATE" : "INSTALLED", "primaryContainer", "onPrimaryContainer"), ip); }
         c.addView(top);
         if (!p.desc.isEmpty()) { TextView ds = text(p.desc, 13, col("Text")); ds.setPadding(0, dp(3), 0, 0); c.addView(ds); }
         String meta = (p.games.isEmpty() ? "no game line" : "for " + String.join(", ", p.games)) + "  ·  by " + (p.author.isEmpty() ? "?" : p.author)
@@ -1135,13 +1354,13 @@ public class MainActivity extends Activity {
 
         LinearLayout btns = hbox();
         btns.setPadding(0, dp(6), 0, 0);
-        if (inst == null) btns.addView(button("Install", true, v -> startInstall(p), true), lpm(0, -2, 1, 3));
-        else if (hasUpdate) btns.addView(button("Update", true, v -> startInstall(p), true), lpm(0, -2, 1, 3));
-        btns.addView(button("View code", false, v -> fetchThen(p, files -> showCode(p.name, files)), false), lpm(0, -2, 1, 3));
-        if (inst != null) btns.addView(dangerButton("Remove", v -> bg.execute(() -> {
+        if (inst == null) btns.addView(withIcon(button("Install", true, v -> startInstall(p), true), "download"), lpm(0, -2, 1, 3));
+        else if (hasUpdate) btns.addView(withIcon(button("Update", true, v -> startInstall(p), true), "download"), lpm(0, -2, 1, 3));
+        btns.addView(withIcon(button("View code", false, v -> fetchThen(p, files -> showCode(p.name, files)), false), "code"), lpm(0, -2, 1, 3));
+        if (inst != null) btns.addView(withIcon(dangerButton("Remove", v -> bg.execute(() -> {
             try { store.remove(p.id); } catch (Exception e) { log("store: remove failed: " + e.getMessage()); }
             ui.post(() -> { storeWaiting = store.updates(false).size(); rebuild(); });
-        })), lpm(0, -2, 1, 3));
+        })), "delete"), lpm(0, -2, 1, 3));
         c.addView(btns);
         return c;
     }
@@ -1151,11 +1370,15 @@ public class MainActivity extends Activity {
         if (busy) return;
         setBusy(true);
         setStatus("downloading " + p.name + "...");
+        progress(0f);
+        store.onProgress = this::progress;
         bg.execute(() -> {
             try {
                 Map<String, byte[]> files = store.download(p);
+                store.onProgress = null;
                 ui.post(() -> { setBusy(false); setStatus("ready"); then.accept(files); });
             } catch (Exception e) {
+                store.onProgress = null;
                 log("store: download of " + p.name + " failed: " + e.getMessage());
                 ui.post(() -> { setBusy(false); setStatus("download failed"); });
             }
@@ -1185,8 +1408,8 @@ public class MainActivity extends Activity {
         android.app.Dialog dl = new android.app.Dialog(this);
         dl.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
         LinearLayout box = vbox();
-        box.setBackground(rr(MenuLook.argb(MenuLook.a(C.get("PopupBg"), 1)), Math.max(4, rounding())));
-        box.setPadding(dp(16), dp(14), dp(16), dp(12));
+        box.setBackground(rr(m3("surfaceContainerHigh"), 28));
+        box.setPadding(dp(24), dp(22), dp(24), dp(18));
         ScrollView sv = new ScrollView(this);
         sv.addView(content);
         box.addView(sv, lp(-1, 0, 1));
@@ -1220,8 +1443,9 @@ public class MainActivity extends Activity {
     void untrustedDialog(Store.Plugin p, Map<String, byte[]> files, String code, String old) {
         boolean isUpdate = !old.isEmpty();
         LinearLayout v = vbox();
-        TextView warn = text("⚠  NOT TRUSTED  ⚠", 22, col("NotifError"));
-        warn.setTypeface(Typeface.DEFAULT_BOLD);
+        ImageView wi = iconView("warning", m3("error"), 40);
+        v.addView(wi, lp(-1, dp(48), 0));
+        TextView warn = text("Not trusted", 24, m3("error"));
         warn.setGravity(Gravity.CENTER);
         v.addView(warn, lp(-1, -2, 0));
         TextView msg = text((isUpdate ? "Update for \"" : "\"") + p.name + "\" was uploaded by " + (p.author.isEmpty() ? "someone" : "\"" + p.author + "\"")
@@ -1320,8 +1544,8 @@ public class MainActivity extends Activity {
         e.setTextSize(15);
         e.setTextColor(col("Text"));
         e.setHintTextColor(col("TextDisabled"));
-        e.setBackground(rrKey("FrameBg"));
-        e.setPadding(dp(12), dp(8), dp(12), dp(8));
+        e.setBackground(rr(m3("surfaceContainerHighest"), 12));
+        e.setPadding(dp(16), dp(12), dp(16), dp(12));
         e.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(maxLen)});
         return e;
     }
@@ -1333,8 +1557,7 @@ public class MainActivity extends Activity {
             if (fs != null) { java.util.Arrays.sort(fs); for (File f : fs) if (f.length() <= 600 * 1024) cands.add(f); }
         }
         LinearLayout v = vbox();
-        TextView t = text("Upload a plugin", 19, col("Text"));
-        t.setTypeface(Typeface.DEFAULT_BOLD);
+        TextView t = text("Upload a plugin", 22, m3("onSurface"));
         v.addView(t);
         v.addView(text("It goes into a review queue. If it's approved it shows up in the store for everyone as COMMUNITY (untrusted), with your code public. "
                 + "Only upload your own work (or with the author's permission). Max 600 KB, and it needs a \"// game: <package>\" line near the top.", 13, col("TextDisabled")));
@@ -1361,7 +1584,7 @@ public class MainActivity extends Activity {
         Runnable onPick = () -> {
             File f = cands.get(pick[0]);
             List<String> gs = Core.pluginGames(f);
-            gameInfo.setText(gs.isEmpty() ? "⚠ this file has no // game: line, the server will refuse it" : "for " + String.join(", ", gs) + "  ·  " + Math.max(1, f.length() / 1024) + " KB");
+            gameInfo.setText(gs.isEmpty() ? "this file has no // game: line, the server will refuse it" : "for " + String.join(", ", gs) + "  ·  " + Math.max(1, f.length() / 1024) + " KB");
             if (name.getText().length() == 0) name.setText(f.getName().replaceAll("\\.js$", "").replace('_', ' '));
             if (desc.getText().length() == 0) desc.setText(pluginDesc(f));
         };
@@ -1389,8 +1612,8 @@ public class MainActivity extends Activity {
             File f = cands.get(pick[0]);
             List<String> gs = Core.pluginGames(f);
             String nm = name.getText().toString().trim(), ds = desc.getText().toString().trim().replaceAll("[\\r\\n]+", " "), au = author.getText().toString().trim();
-            if (gs.isEmpty()) { gameInfo.setText("⚠ add a \"// game: <package>\" line to the top of the file first"); return; }
-            if (nm.length() < 2 || au.isEmpty()) { gameInfo.setText("⚠ name and author are needed"); return; }
+            if (gs.isEmpty()) { gameInfo.setText("add a \"// game: <package>\" line to the top of the file first"); return; }
+            if (nm.length() < 2 || au.isEmpty()) { gameInfo.setText("name and author are needed"); return; }
             dev.vrfrida.Settings.prefs(this).edit().putString("storeAuthor", au).apply();
             String updates = upd[0] == 0 ? "" : mineCommunity.get(upd[0]);
             dl[0].dismiss();
@@ -1414,13 +1637,10 @@ public class MainActivity extends Activity {
     View lookTab() {
         LinearLayout d = vbox();
         LinearLayout head = hbox();
-        TextView t = text("Menu look", 19, col("Text"));
-        t.setTypeface(Typeface.DEFAULT_BOLD);
-        head.addView(t, lp(0, -2, 1));
         String[] scopes = sel != null ? new String[]{"All games (synced)", sel.label + " only"} : new String[]{"All games (synced)"};
         View sc = combo(scopes, Math.min(lookScope, scopes.length - 1), i -> { flushSave(); lookScope = i; rebuild(); });
-        head.addView(sc, lpm(-2, -2, 0, 3));
-        d.addView(head);
+        d.addView(row("Editing", sc));
+        d.addView(menuPreview());
 
         if (lookScope == 0 || sel == null) {
             TextView h = text("One look for every game: games with \"Synced look\" on (the default) get these settings copied into their menu on every Launch / Inject. Only what you change here is copied; mods and plugin settings in each game are kept.", 13, col("TextDisabled"));
@@ -1468,17 +1688,48 @@ public class MainActivity extends Activity {
         }
 
         d.addView(section("This app"));
-        String[] srcs = {"Menu look (shown above)", MenuLook.hasUxpatcher(this) ? "UXpatcher colors" : "UXpatcher (not installed)"};
-        int si = MenuLook.UXPATCHER.equals(appTheme()) ? 1 : 0;
-        d.addView(row("App Colors", combo(srcs, si, i -> {
-            try { appLook.root.put("appTheme", i == 1 ? MenuLook.UXPATCHER : MenuLook.GAME); } catch (Exception ignored) {}
-            appLookChanged(true);
-        })));
-        d.addView(row("Animated Background", checkbox(animateBg(), "off = still background, lighter on the headset", v -> {
-            try { appLook.root.put("animate", v); } catch (Exception ignored) {}
+        String[] srcs = {"Auto (" + (MenuLook.hasUxpatcher(this) ? "UXpatcher" : "Meta") + ")", "Meta", MenuLook.hasUxpatcher(this) ? "UXpatcher" : "UXpatcher (not installed)"};
+        String at = appTheme();
+        d.addView(row("App theme", combo(srcs, at.equals("meta") ? 1 : at.equals("uxpatcher") ? 2 : 0, i -> {
+            try { appLook.root.put("appTheme", i == 1 ? "meta" : i == 2 ? "uxpatcher" : "auto"); } catch (Exception ignored) {}
             appLookChanged(true);
         })));
         return d;
+    }
+
+    /** live preview of the menu look being edited (the menu's own background + colors) */
+    View menuPreview() {
+        FrameLayout f = new FrameLayout(this);
+        MenuBgView bgv = new MenuBgView(this, look, new MenuBgView.Source() {
+            @Override public MenuCfg cfg() { return shownCfg(); }
+            @Override public Map<String, float[]> colors() { return menuColorsNow(); }
+            @Override public boolean animate() { return animateBg(); }
+        });
+        f.addView(bgv, new FrameLayout.LayoutParams(-1, -1));
+        Map<String, float[]> mc = menuColorsNow();
+        LinearLayout over = vbox();
+        over.setPadding(dp(18), dp(14), dp(18), dp(14));
+        TextView a = text("Menu preview", 18, MenuLook.argb(mc.get("Text")));
+        a.setTypeface(medium());
+        over.addView(a);
+        over.addView(text("theme: " + shownThemeId() + "  ·  this is how the in-game menu looks", 13, MenuLook.argb(mc.get("TextDisabled"))));
+        LinearLayout chips = hbox();
+        chips.setPadding(0, dp(10), 0, 0);
+        for (String k : new String[]{"TabActive", "Button", "FrameBg", "Check"}) {
+            View sw = new View(this);
+            sw.setBackground(rr(MenuLook.argb(MenuLook.a(mc.get(k), 1)), 8));
+            LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(dp(34), dp(20));
+            sp.setMargins(0, 0, dp(6), 0);
+            chips.addView(sw, sp);
+        }
+        over.addView(chips);
+        f.addView(over, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+        f.setClipToOutline(true);
+        f.setBackground(rr(m3("surfaceContainerLowest"), 16));
+        LinearLayout.LayoutParams p = lp(-1, dp(150), 0);
+        p.setMargins(0, dp(10), 0, dp(4));
+        f.setLayoutParams(p);
+        return f;
     }
 
     /** take the selected game's current menu look as the synced look */
@@ -1541,8 +1792,7 @@ public class MainActivity extends Activity {
     View logTab() {
         LinearLayout d = vbox();
         LinearLayout head = hbox();
-        TextView t = text(sel != null ? "Log  ·  " + sel.label : "Log", 19, col("Text"));
-        t.setTypeface(Typeface.DEFAULT_BOLD);
+        TextView t = text(sel != null ? sel.label : "", 20, m3("onSurface"));
         head.addView(t, lp(0, -2, 1));
         head.addView(button("Clear", false, v -> { synchronized (appLog) { appLog.setLength(0); } logSig = ""; refreshLogs(); }, false));
         d.addView(head);
