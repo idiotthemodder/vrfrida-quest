@@ -628,6 +628,12 @@ public class MainActivity extends Activity {
         b.setCompoundDrawablesRelative(d, null, null, null);
         b.setCompoundDrawablePadding(dp(8));
         b.setPadding(dp(16), b.getPaddingTop(), dp(20), b.getPaddingBottom());
+        // keep icon + label together in the middle of wide (weighted / stacked) buttons, like M3
+        b.addOnLayoutChangeListener((v, l, t, r, bt, ol, ot, or, ob) -> {
+            int content = dp(18) + dp(8) + (int) Math.ceil(b.getPaint().measureText(b.getText().toString()));
+            int pad = Math.max(dp(16), (r - l - content) / 2);
+            if (b.getPaddingLeft() != pad) b.post(() -> b.setPadding(pad, b.getPaddingTop(), Math.max(dp(8), r - l - content - pad), b.getPaddingBottom()));
+        });
         return b;
     }
 
