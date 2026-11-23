@@ -54,10 +54,10 @@ import java.util.concurrent.Executors;
 
 /** the app, drawn to look like UniversalMenu (same themes, backgrounds and widgets) */
 public class MainActivity extends Activity {
-    static final String[] TABS = {"Games", "Plugins", "Store", "Menu Look", "Log", "Info", "Logcat"};
+    static final String[] TABS = {"Games", "Plugins", "Store", "Menu Look", "Log", "Info", "Logcat", "Mic"};
 
     static final class Game {
-        ApplicationInfo ai; String label; Bitmap icon; String fp = ""; String bridge = "?"; boolean running, injected, fav, patched;
+        ApplicationInfo ai; String label; Bitmap icon; String fp = ""; String bridge = "?"; boolean running, injected, fav, patched, outdated; long patchVer;
     }
 
     final Handler ui = new Handler(Looper.getMainLooper());
@@ -101,7 +101,7 @@ public class MainActivity extends Activity {
         String want = "";
         try { want = new String(Files.read(trig), "UTF-8").trim(); } catch (Exception ignored) {}
         trig.delete();
-        if (want.matches("[0-6]") && Integer.parseInt(want) != tab) { goTab(Integer.parseInt(want)); ui.postDelayed(() -> { try { Files.write(trig, new byte[0]); } catch (Exception ignored) {} }, 1500); return; }
+        if (want.matches("[0-7]") && Integer.parseInt(want) != tab) { goTab(Integer.parseInt(want)); ui.postDelayed(() -> { try { Files.write(trig, new byte[0]); } catch (Exception ignored) {} }, 1500); return; }
         try {
             View v = getWindow().getDecorView();
             Bitmap b = Bitmap.createBitmap(v.getWidth(), v.getHeight(), Bitmap.Config.ARGB_8888);
@@ -117,6 +117,9 @@ public class MainActivity extends Activity {
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         core = new Core(this, this::log);
+        sysMic = new SysMic(this, core);
+        Core.loadMicGames(this);
+        Sounds.maxSec = dev.vrfrida.Settings.prefs(this).getInt("soundMaxSec", 0);
         updater = new Updater(this, this::log);
         store = new Store(this, this::log);
         noRoot = new NoRoot(this, this::log, () -> { setBusy(false); bg.execute(this::scanGames); });
@@ -188,6 +191,7 @@ public class MainActivity extends Activity {
         SharedPreferences.Editor ed = sp.edit();
         Set<String> favs = dev.vrfrida.Settings.favorites(this);
         List<Game> found = new ArrayList<>();
+        long appVer = NoRoot.appVersion(this);
         int px = dp(44);
         for (PackageInfo pi : pm.getInstalledPackages(0)) {
             ApplicationInfo ai = pi.applicationInfo;
@@ -195,19 +199,24 @@ public class MainActivity extends Activity {
             if (Core.SYSTEM.matcher(ai.packageName).find()) continue;
             String want = ai.sourceDir + "|" + pi.lastUpdateTime + "|";
             String c = sp.getString("scan2:" + ai.packageName, null), fp;
-            boolean patched;
-            if (c != null && c.startsWith(want)) { fp = c.substring(want.length()); patched = fp.endsWith("#gadget"); fp = fp.replace("#gadget", ""); }
+            long patchVer;
+            // cache: <apk>|<updated>|<bridge fingerprint>#pv<vrfrida version that patched it, 0 = not patched, -1 = older than v10>
+            int at = c != null && c.startsWith(want) ? c.indexOf("#pv", want.length()) : -1;
+            if (at >= 0) { fp = c.substring(want.length(), at); patchVer = Long.parseLong(c.substring(at + 3)); }
             else {
                 Bridge.Lib lib = Bridge.findLib(ai);
                 fp = lib == null ? "-" : lib.fingerprint();
-                patched = lib != null && NoRoot.isPatched(ai);
-                ed.putString("scan2:" + ai.packageName, want + fp + (patched ? "#gadget" : ""));
+                patchVer = lib == null ? 0 : NoRoot.patchVersion(ai);
+                ed.putString("scan2:" + ai.packageName, want + fp + "#pv" + patchVer);
             }
+            boolean patched = patchVer != 0;
             if (fp.equals("-") || pm.getLaunchIntentForPackage(ai.packageName) == null) continue;
             Game g = new Game();
             g.ai = ai;
             g.fp = fp;
             g.patched = patched;
+            g.outdated = patched && patchVer < appVer;
+            g.patchVer = patchVer;
             g.label = String.valueOf(pm.getApplicationLabel(ai));
             g.icon = iconBitmap(pm.getApplicationIcon(ai), px);
             g.fav = favs.contains(ai.packageName);
@@ -561,6 +570,99 @@ public class MainActivity extends Activity {
         core.pushSoundsToAll(pkgs, rootOk);
     }
 
+    // ---------------------------------------------------------------- sound manager (play / rename / delete)
+    android.media.MediaPlayer preview;
+
+    void stopPreview() {
+        if (preview != null) { try { preview.stop(); } catch (Exception ignored) {} preview.release(); preview = null; }
+    }
+
+    void playPreview(File f) {
+        stopPreview();
+        try {
+            preview = new android.media.MediaPlayer();
+            preview.setDataSource(f.getPath());
+            preview.setOnCompletionListener(mp -> stopPreview());
+            preview.prepare();
+            int max = Sounds.maxSec * 1000;
+            preview.start();
+            if (max > 0) { final android.media.MediaPlayer mine = preview; ui.postDelayed(() -> { if (preview == mine) stopPreview(); }, max); }
+        } catch (Exception e) { log("can't play " + f.getName() + ": " + e.getMessage()); stopPreview(); }
+    }
+
+    static List<File> soundFiles() {
+        List<File> out = new ArrayList<>();
+        File[] fs = Paths.SOUNDS.listFiles();
+        if (fs != null) for (File f : fs) if (f.isFile() && Sounds.isAudio(f.getName())) out.add(f);
+        out.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+        return out;
+    }
+
+    void soundManager() {
+        final boolean[] changed = {false};
+        LinearLayout list = vbox();
+        list.setPadding(dp(16), dp(8), dp(16), dp(8));
+        ScrollView sv = new ScrollView(this);
+        sv.addView(list);
+        android.app.AlertDialog dlg = new android.app.AlertDialog.Builder(this)
+                .setTitle("Sounds (" + soundCount() + ")")
+                .setView(sv)
+                .setPositiveButton("Done", null)
+                .create();
+        Runnable[] fill = new Runnable[1];
+        fill[0] = () -> {
+            list.removeAllViews();
+            List<File> fs = soundFiles();
+            if (fs.isEmpty()) list.addView(text("No sounds yet: use Add sounds.", 14, col("TextDisabled")));
+            long total = 0;
+            for (File f : fs) {
+                total += f.length();
+                LinearLayout r = new LinearLayout(this);
+                r.setOrientation(LinearLayout.HORIZONTAL);
+                r.setGravity(Gravity.CENTER_VERTICAL);
+                r.setPadding(0, dp(3), 0, dp(3));
+                TextView n = text(f.getName() + "   " + Math.max(1, f.length() / 1024) + " KB", 14, col("Text"));
+                n.setSingleLine(true);
+                n.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+                r.addView(n, new LinearLayout.LayoutParams(0, -2, 1));
+                r.addView(button("Play", false, v -> playPreview(f), false));
+                r.addView(button("Rename", false, v -> renameSound(f, () -> { changed[0] = true; fill[0].run(); }), false));
+                r.addView(dangerButton("Delete", v -> new android.app.AlertDialog.Builder(this)
+                        .setMessage("Delete " + f.getName() + "?\n\nIt's removed from every game on the next push. The original file you picked stays where it was.")
+                        .setPositiveButton("Delete", (x, w) -> { stopPreview(); if (f.delete()) { changed[0] = true; log("deleted sound " + f.getName()); } fill[0].run(); })
+                        .setNegativeButton("Cancel", null).show()));
+                list.addView(r);
+            }
+            dlg.setTitle("Sounds (" + fs.size() + ", " + DeviceInfo.mb(total) + ")");
+        };
+        fill[0].run();
+        dlg.setOnDismissListener(x -> {
+            stopPreview();
+            if (changed[0]) { io.execute(this::pushSoundsNow); ui.post(this::rebuild); }
+        });
+        dlg.show();
+        if (dlg.getWindow() != null) dlg.getWindow().setLayout(dp(900), dp(700));
+    }
+
+    void renameSound(File f, Runnable after) {
+        String name = f.getName(), ext = name.substring(name.lastIndexOf('.'));
+        EditText e = new EditText(this);
+        e.setText(name.substring(0, name.lastIndexOf('.')));
+        e.setSingleLine(true);
+        e.setSelectAllOnFocus(true);
+        new android.app.AlertDialog.Builder(this).setTitle("Rename").setView(e)
+                .setPositiveButton("Rename", (d, w) -> {
+                    String n = e.getText().toString().replaceAll("[/\\\\:*?\"<>|]", "_").trim();
+                    if (n.isEmpty()) return;
+                    File to = new File(f.getParentFile(), n + ext);
+                    if (to.exists()) { log(to.getName() + " already exists"); return; }
+                    stopPreview();
+                    if (f.renameTo(to)) log("renamed " + name + " -> " + to.getName()); else log("couldn't rename " + name);
+                    after.run();
+                })
+                .setNegativeButton("Cancel", null).show();
+    }
+
     static int soundCount() {
         File[] fs = Paths.SOUNDS.listFiles();
         int n = 0;
@@ -661,6 +763,7 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        // the audioserver hook stays loaded on purpose (party chat keeps working with the app closed); Unload hook removes it
         if (noRoot != null) noRoot.close();
         logcat.stop();
         if (updater != null) updater.close();
@@ -1094,7 +1197,7 @@ public class MainActivity extends Activity {
         tabScroll = new ScrollView(this);
         tabScroll.setFillViewport(true);
         tabScroll.setVerticalScrollBarEnabled(true);
-        View body = tab == 0 ? gamesTab() : tab == 1 ? pluginsTab() : tab == 2 ? storeTab() : tab == 3 ? lookTab() : tab == 4 ? logTab() : tab == 5 ? infoTab() : logcatTab();
+        View body = tab == 0 ? gamesTab() : tab == 1 ? pluginsTab() : tab == 2 ? storeTab() : tab == 3 ? lookTab() : tab == 4 ? logTab() : tab == 5 ? infoTab() : tab == 6 ? logcatTab() : micTab();
         tabScroll.addView(body);
         tabScroll.setPadding(dp(16), dp(8), dp(20), dp(16));
         tabScroll.setClipToPadding(false);
@@ -1140,7 +1243,7 @@ public class MainActivity extends Activity {
         return t;
     }
 
-    static final String[] TAB_ICONS = {"games", "extension", "store", "palette", "article", "bolt", "code"};
+    static final String[] TAB_ICONS = {"games", "extension", "store", "palette", "article", "bolt", "code", "mic"};
 
     /** M3 navigation rail: icon in a pill indicator, label under it */
     View navRail() {
@@ -1300,8 +1403,8 @@ public class MainActivity extends Activity {
         name.setSingleLine(true);
         name.setEllipsize(android.text.TextUtils.TruncateAt.END);
         col.addView(name);
-        String st = g.injected ? "● menu loaded" : g.running ? "running" : g.patched ? "patched (no root)" + (rootOk ? "" : "  ·  bridge " + g.bridge) : "bridge " + g.bridge;
-        int sc = g.injected ? m3("success") : s ? M3.mix(onBg, m3("secondaryContainer"), 0.25) : g.running || g.bridge.equals("fresh") || g.patched ? m3("onSurfaceVariant") : m3("warning");
+        String st = g.injected ? "● menu loaded" : g.running ? "running" : g.outdated ? "repatch needed (patched by an older vrfrida)" : g.patched ? "patched (no root)" + (rootOk ? "" : "  ·  bridge " + g.bridge) : "bridge " + g.bridge;
+        int sc = g.injected ? m3("success") : s ? M3.mix(onBg, m3("secondaryContainer"), 0.25) : g.outdated ? m3("warning") : g.running || g.bridge.equals("fresh") || g.patched ? m3("onSurfaceVariant") : m3("warning");
         col.addView(text(st, 12, sc));
         r.addView(col, lp(0, -2, 1));
         ImageView star = iconView(g.fav ? "star" : "star_border", g.fav ? m3("warning") : m3("onSurfaceVariant"), 22);
@@ -1361,6 +1464,12 @@ public class MainActivity extends Activity {
         r3.addView(withIcon(button(sel.patched ? "Repatch + update" : "Patch + install", !rootOk, v -> patchAndInstall(), true), "build"), lpm(0, -2, 1.4f, 3));
         r3.addView(withIcon(button("Update mods", false, v -> job("update mods (no root)", g -> noRoot.updateAgent(core, g.ai, cfg), false), true), "sync"), lpm(0, -2, 1, 3));
         d.addView(r3);
+        if (sel.outdated) {
+            TextView w = text("Repatch needed: this game was patched by " + (sel.patchVer < 0 ? "an older vrfrida (from before patches were marked)" : "vrfrida v" + sel.patchVer)
+                    + ", the app is v" + NoRoot.appVersion(this) + ". Its menu misses the newer fixes until you press Repatch + update (keeps game data).", 13, col("NotifWarn"));
+            w.setPadding(0, dp(4), 0, dp(2));
+            d.addView(w);
+        }
         TextView nr = text(sel.patched
                 ? "Patched: the menu starts by itself in this game. Repatch after changing plugins / menu or after a store update (installs as an update, keeps game data)."
                 : "Copies the game, adds Frida Gadget + the menu, re-signs it and installs it. The first time the store copy is uninstalled (Android deletes its local data; online saves stay). Uses Menu Delay and V8 from below.", 12, col("TextDisabled"));
@@ -1379,11 +1488,25 @@ public class MainActivity extends Activity {
         d.addView(section("Sounds (every game)"));
         LinearLayout rs = hbox();
         rs.addView(withIcon(button("Add sounds", true, v -> pickSounds(), true), "upload"), lpm(0, -2, 1, 3));
+        rs.addView(withIcon(button("Manage", false, v -> soundManager(), false), "article"), lpm(0, -2, 1, 3));
         rs.addView(withIcon(button("Push to all games", false, v -> io.execute(this::pushSoundsNow), true), "sync"), lpm(0, -2, 1, 3));
         d.addView(rs);
         TextView sn = text(soundCount() + " sound(s) in " + Paths.SOUNDS + ". Pick mp3 / ogg / wav / m4a files from the headset: they're converted and copied into every game's soundboard (root or no root: without root it uses the game's Android/obb folder, so allow Install unknown apps).", 12, col("TextDisabled"));
         sn.setPadding(0, dp(2), 0, 0);
         d.addView(sn);
+        d.addView(row("Clip length (s)", slider(Sounds.maxSec, 0, 60, 0, v -> {
+            int n = (int) Math.round(v);
+            if (n == Sounds.maxSec) return;
+            Sounds.maxSec = n;
+            dev.vrfrida.Settings.prefs(this).edit().putInt("soundMaxSec", n).apply();
+        })));
+        TextView cl = text("Keep only the first N seconds of every sound, 0 = whole file. Full songs take ~3 MB a minute per game; a soundboard rarely needs more than 15 s. Press Push to all games after changing it.", 12, col("TextDisabled"));
+        cl.setPadding(0, dp(2), 0, 0);
+        d.addView(cl);
+        d.addView(row("Mic soundboard", checkbox(Core.micGames.contains(pkg), "play your sounds through your mic in this game (menu \u203a Plugins \u203a mic soundboard). Copies your sounds into it", v -> {
+            Core.setMicGame(this, pkg, v);
+            io.execute(this::pushSoundsNow);   // on: copies the sounds in, off: removes them
+        })));
         if (rootOk) d.addView(libsBox(pkg));
 
         d.addView(section("Log"));
@@ -2022,6 +2145,7 @@ public class MainActivity extends Activity {
         card.addView(fetchRow);
         LinearLayout b = hbox();
         b.addView(withIcon(button("Copy info", true, v -> copyText("vrfrida info", infoText), false), "upload"), lpm(0, -2, 1, 3));
+        b.addView(withIcon(button("Send debug report", false, v -> sendReport(), true), "upload"), lpm(0, -2, 1, 3));
         b.addView(withIcon(button("Refresh", false, v -> rebuild(), false), "refresh"), lpm(0, -2, 1, 3));
         LinearLayout.LayoutParams blp = lp(-1, -2, 0);
         blp.setMargins(0, dp(8), 0, 0);
@@ -2205,6 +2329,74 @@ public class MainActivity extends Activity {
         } catch (Exception e) { return "can't read " + f + ": " + e.getMessage(); }
     }
 
+    // ---------------------------------------------------------------- debug report upload
+    void sendReport() {
+        Game g = sel;
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Send debug report?")
+                .setMessage("Uploads one text file to the vrfrida server and gives you a 6-letter code to post (Discord etc).\n\n"
+                        + "It has: the Info tab (headset model, Android build, storage, permissions, your installed games count)"
+                        + (g != null ? ", and for " + g.label + ": its version, patch state, crash report, game log and the recorded logcat" : "")
+                        + ".\nGame logs can contain your in-game name or ids.\n\nOnly the vrfrida dev can open it with the code. It's deleted after 7 days.")
+                .setPositiveButton("Send", (d, w) -> job("send debug report", x -> {
+                    String code = uploadReport(g);
+                    log("debug report sent: code " + code + " (valid 7 days)");
+                    ui.post(() -> showReportCode(code));
+                }, false))
+                .setNegativeButton("Cancel", null).show();
+    }
+
+    /** background thread */
+    String uploadReport(Game g) throws Exception {
+        if (Store.uploadUrl().isEmpty()) throw new Exception("no server set in this build");
+        long ver = updater.installedVersion();
+        int games, patched = 0;
+        synchronized (this.games) { games = this.games.size(); for (Game x : this.games) if (x.patched) patched++; }
+        StringBuilder t = new StringBuilder();
+        t.append("vrfrida@").append(Build.MODEL).append('\n');
+        for (String[] r : DeviceInfo.fetch(this, rootOk, games, patched, Core.allPlugins().size(), soundCount(), ver)) t.append(r[0]).append(": ").append(r[1]).append('\n');
+        t.append('\n').append(DeviceInfo.report(this, rootOk, g != null ? g.ai : null, g != null ? g.fp : null, ver));
+        if (g != null) {
+            String pkg = g.ai.packageName;
+            t.append("\n==== crashes ====\n").append(CrashReader.read(pkg, g.ai.uid, rootOk, canReadLogs()));
+            t.append("\n==== game log ====\n").append(readTail(NoRoot.obbGameLog(pkg), 120000, "none"));
+            t.append("\n\n==== logcat (last recording) ====\n").append(readTail(GameLogcat.fileFor(pkg), 300000, "none recorded (Logcat tab)"));
+        }
+        synchronized (appLog) { t.append("\n\n==== vrfrida log ====\n").append(appLog.length() > 60000 ? appLog.substring(appLog.length() - 60000) : appLog); }
+        String text = t.length() > 590000 ? t.substring(0, 590000) + "\n[cut]" : t.toString();
+        JSONObject b = new JSONObject();
+        b.put("text", text);
+        byte[] body = b.toString().getBytes("UTF-8");
+        java.net.HttpURLConnection c = Updater.open(Store.uploadUrl() + "/v1/report/submit");
+        c.setRequestMethod("POST");
+        c.setDoOutput(true);
+        c.setRequestProperty("Content-Type", "application/json");
+        c.setFixedLengthStreamingMode(body.length);
+        try (java.io.OutputStream o = c.getOutputStream()) { o.write(body); }
+        int st = c.getResponseCode();
+        java.io.InputStream in = st < 400 ? c.getInputStream() : c.getErrorStream();
+        String resp = in == null ? "" : new String(Files.readAll(in), "UTF-8");
+        JSONObject r;
+        try { r = new JSONObject(resp); } catch (Exception e) { throw new Exception("server answered " + st + (st == 404 ? " (the server doesn't have debug reports yet)" : "")); }
+        if (!r.optBoolean("ok")) throw new Exception(r.optString("err", "server answered " + st));
+        return r.getString("code");
+    }
+
+    void showReportCode(String code) {
+        TextView big = text(code, 44, m3("primary"));
+        big.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        big.setGravity(Gravity.CENTER);
+        big.setLetterSpacing(0.2f);
+        big.setTextIsSelectable(true);
+        big.setPadding(dp(16), dp(20), dp(16), dp(8));
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Debug report sent")
+                .setView(big)
+                .setMessage("Post this code to the vrfrida dev. It works for 7 days.")
+                .setPositiveButton("Copy code", (d, w) -> copyText("report code", code))
+                .setNegativeButton("Close", null).show();
+    }
+
     // ---------------------------------------------------------------- Logcat tab
     final GameLogcat logcat = new GameLogcat();
     TextView logcatView, logcatHead;
@@ -2224,6 +2416,97 @@ public class MainActivity extends Activity {
         if (logcatHead != null) logcatHead.setText(logcat.pkg == null ? "not recording"
                 : (logcat.running ? "recording " : "stopped: ") + logcat.pkg + "  ·  " + logcat.total + " lines  ·  saved to " + GameLogcat.fileFor(logcat.pkg));
         if (atEnd && tabScroll != null) tabScroll.post(() -> tabScroll.fullScroll(View.FOCUS_DOWN));
+    }
+
+    // ---------------------------------------------------------------- Mic tab (system-wide mic soundboard, root)
+    SysMic sysMic;
+    volatile boolean sysMicOn;
+    TextView sysMicStatus, sysMicLog;
+
+    View micTab() {
+        LinearLayout d = vbox();
+        d.addView(text("Mic soundboard", 20, m3("onSurface")));
+        TextView h = text("Two ways to play your sounds through your microphone:\n"
+                + "  \u2022 In a game: open the menu \u203a Plugins \u203a mic soundboard (every game, root or no root). Turn on \"Mic soundboard\" for the game on the Games tab so your sounds get copied into it.\n"
+                + "  \u2022 Everywhere (root): below. vrfrida hooks the headset's audio service, so every app that records the mic gets the sound as your voice: Meta party chat, every game's voice chat, recorders.", 13, m3("onSurfaceVariant"));
+        h.setPadding(0, dp(4), 0, dp(4));
+        d.addView(h);
+        if (!rootOk) {
+            TextView w = text("System-wide needs root. Use the in-game one from the menu.", 14, col("NotifWarn"));
+            w.setPadding(0, dp(8), 0, 0);
+            d.addView(w);
+            return d;
+        }
+        android.content.SharedPreferences pr = dev.vrfrida.Settings.prefs(this);
+        d.addView(section("Everywhere (root)"));
+        sysMicStatus = text(sysMicOn ? "hook loaded in audioserver" : "not loaded (Play loads it)", 13, sysMicOn ? col("NotifSuccess") : m3("onSurfaceVariant"));
+        d.addView(sysMicStatus);
+        LinearLayout b = hbox();
+        b.addView(withIcon(button("Stop sound", true, v -> io.execute(() -> { try { sysMic.stopSound(); } catch (Exception e) { log("mic: " + e.getMessage()); } stopPreview(); }), false), "stop"), lpm(0, -2, 1, 3));
+        b.addView(withIcon(button(sysMicOn ? "Unload hook" : "Load hook", false, v -> io.execute(() -> {
+            if (sysMicOn) { sysMic.stop(); sysMicOn = false; log("mic: audioserver hook unloaded"); }
+            else micStart();
+            ui.post(this::rebuild);
+        }), true), sysMicOn ? "clear" : "bolt"), lpm(0, -2, 1, 3));
+        b.addView(withIcon(button("Status", false, v -> io.execute(() -> { try { sysMic.status(); Thread.sleep(400); } catch (Exception e) { log("mic: " + e.getMessage()); } ui.post(this::refreshMicLog); }), false), "refresh"), lpm(0, -2, 1, 3));
+        d.addView(b);
+        d.addView(row("Volume", slider(pr.getFloat("micVol", 1f), 0, 3, 2, v -> { pr.edit().putFloat("micVol", v.floatValue()).apply(); micSettings(); })));
+        d.addView(row("Mute real voice", checkbox(pr.getBoolean("micMute", false), "only the sound goes out while it plays", v -> { pr.edit().putBoolean("micMute", v).apply(); micSettings(); })));
+        d.addView(row("Loop", checkbox(pr.getBoolean("micLoop", false), "repeat until Stop sound", v -> { pr.edit().putBoolean("micLoop", v).apply(); micSettings(); })));
+        d.addView(row("Hear it myself", checkbox(pr.getBoolean("micHear", true), "also play it on the headset (apps never play your mic back to you)", v -> pr.edit().putBoolean("micHear", v).apply())));
+
+        List<File> sounds = soundFiles();
+        d.addView(section("Sounds (" + sounds.size() + ")"));
+        if (sounds.isEmpty()) d.addView(text("No sounds yet: add some on the Games tab (Sounds \u203a Add sounds).", 13, col("TextDisabled")));
+        for (File f : sounds) {
+            LinearLayout r = hbox();
+            r.setGravity(Gravity.CENTER_VERTICAL);
+            r.setPadding(0, dp(2), 0, dp(2));
+            TextView n = text(f.getName().replaceAll("\\.[^.]+$", ""), 14, m3("onSurface"));
+            r.addView(n, lpm(0, -2, 1, 3));
+            r.addView(withIcon(button("Play", false, v -> io.execute(() -> micPlay(f)), false), "play"), lpm(-2, -2, 0, 3));
+            d.addView(r);
+        }
+        d.addView(section("Hook log"));
+        sysMicLog = terminal(d, "cat " + SysMic.log().getPath(), 11);
+        refreshMicLog();
+        return d;
+    }
+
+    void refreshMicLog() {
+        if (sysMicLog == null) return;
+        StringBuilder sb = new StringBuilder();
+        for (String l : SysMic.tail(6000).split("\n")) if (!l.trim().isEmpty()) sb.append(l).append('\n');
+        sysMicLog.setText(sb.length() == 0 ? "(nothing yet)" : sb.toString().trim());
+    }
+
+    boolean micStart() {
+        try {
+            String err = sysMic.start();
+            if (err != null) { log("mic: " + err); return false; }
+            sysMicOn = true;
+            log("mic: audioserver hook loaded");
+            ui.post(this::refreshMicLog);
+            return true;
+        } catch (Exception e) { log("mic: couldn't start: " + e); return false; }
+    }
+
+    void micSettings() {
+        if (!sysMicOn) return;
+        android.content.SharedPreferences pr = dev.vrfrida.Settings.prefs(this);
+        io.execute(() -> { try { sysMic.settings(pr.getFloat("micVol", 1f), pr.getBoolean("micMute", false), pr.getBoolean("micLoop", false)); } catch (Exception e) { log("mic: " + e.getMessage()); } });
+    }
+
+    void micPlay(File f) {
+        android.content.SharedPreferences pr = dev.vrfrida.Settings.prefs(this);
+        if (!sysMicOn && !micStart()) return;
+        ui.post(this::rebuild);
+        try {
+            sysMic.play(f, pr.getFloat("micVol", 1f), pr.getBoolean("micMute", false), pr.getBoolean("micLoop", false));
+            if (pr.getBoolean("micHear", true)) ui.post(() -> playPreview(f));
+            Thread.sleep(300);
+        } catch (Exception e) { log("mic: " + e.getMessage()); }
+        ui.post(this::refreshMicLog);
     }
 
     View logcatTab() {
@@ -2269,8 +2552,31 @@ public class MainActivity extends Activity {
             gl.setPadding(dp(10), dp(8), dp(10), dp(8));
             d.addView(gl, lp(-1, -2, 0));
         }
+        if (pkg != null) {
+            LinearLayout cb = hbox();
+            cb.addView(withIcon(button("Read crashes", true, v -> readCrashes(), false), "warning"), lpm(0, -2, 1, 3));
+            cb.addView(withIcon(button("Copy", false, v -> copyText("crash report", crashText), false), "upload"), lpm(0, -2, 1, 3));
+            LinearLayout.LayoutParams clp = lp(-1, -2, 0);
+            clp.setMargins(0, dp(14), 0, 0);
+            d.addView(cb, clp);
+            crashView = terminal(d, "crashes " + pkg, 11);
+            crashView.setText(crashText.isEmpty() || !pkg.equals(crashPkg) ? "press Read crashes" : crashText);
+        }
         ui.post(this::refreshLogcat);
         return d;
+    }
+
+    TextView crashView;
+    String crashText = "", crashPkg = "";
+
+    void readCrashes() {
+        if (sel == null) return;
+        Game g = sel;
+        if (crashView != null) crashView.setText("reading...");
+        io.execute(() -> {
+            String t = CrashReader.read(g.ai.packageName, g.ai.uid, rootOk, canReadLogs());
+            ui.post(() -> { crashText = t; crashPkg = g.ai.packageName; if (crashView != null) crashView.setText(colorReport(t)); });
+        });
     }
 
     View logTab() {

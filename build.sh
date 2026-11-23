@@ -30,9 +30,11 @@ fi
 rm -rf "$OUT"; mkdir -p "$OUT"/{assets/seed/plugins,assets/seed/patterns,assets/seed/sounds,res,classes,apk/lib/arm64-v8a}
 
 echo "== menu + bridge template"
+python3 "$MODS/builtin/gen.py"   # builtin/*.js -> vendor/builtin_plugins.ts
 (cd "$MODS" && frida-compile UniversalMenu.ts -S -B iife -T none -o "$OLDPWD/$OUT/assets/menu.js")
 cp "$TOOLKIT_BRIDGE" "$OUT/assets/frida-il2cpp-bridge.js"
 cp assets/appsafety_spoof.js "$OUT/assets/appsafety_spoof.js"
+cp assets/sysmic.js "$OUT/assets/sysmic.js"   # system-wide mic soundboard (injected into audioserver)
 cp "$MODS/store/scan_rules.json" "$OUT/assets/scan_rules.json"   # store safety scan rules (the app also downloads newer ones)
 # patchkey/ is NOT bundled: the app makes / loads a per-device key (ApkPatch.keyDir)
 

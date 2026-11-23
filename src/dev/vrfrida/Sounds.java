@@ -20,6 +20,8 @@ import java.util.Set;
 final class Sounds {
     static final String[] EXT = {".wav", ".mp3", ".ogg", ".m4a", ".flac", ".aac", ".opus", ".wma"};
     static final int RATE = 24000;
+    /** keep only the first N seconds of every sound (0 = whole file). Set from the app's settings */
+    static volatile int maxSec = 0;
 
     static boolean isAudio(String n) {
         String l = n.toLowerCase();
@@ -44,6 +46,16 @@ final class Sounds {
         List<File> out = new ArrayList<>();
         Set<String> used = new HashSet<>();
         Paths.SOUND_CACHE.mkdirs();
+        // the clip length changed since the cache was made: convert everything again
+        File mark = new File(Paths.SOUND_CACHE, ".maxsec");
+        String want = String.valueOf(maxSec), had = "";
+        try { had = new String(Files.read(mark), "UTF-8").trim(); } catch (Exception ignored) {}
+        if (!want.equals(had)) {
+            File[] old = Paths.SOUND_CACHE.listFiles();
+            if (old != null) for (File f : old) if (f.getName().toLowerCase().endsWith(".wav")) f.delete();
+            try { Files.write(mark, want.getBytes("UTF-8")); } catch (Exception ignored) {}
+            if (!had.isEmpty()) log.log("  clip length changed (" + (maxSec == 0 ? "whole files" : maxSec + " s") + "), converting the sounds again");
+        }
         for (File src : sources(pkg)) {
             String base = src.getName();
             int dot = base.lastIndexOf('.');
@@ -55,7 +67,7 @@ final class Sounds {
             File dst = new File(Paths.SOUND_CACHE, name);
             if (dst.isFile() && dst.lastModified() >= src.lastModified() && isTargetWav(dst)) { out.add(dst); continue; }
             try {
-                if (isTargetWav(src)) copy(src, dst);
+                if (isTargetWav(src) && (maxSec == 0 || src.length() <= 44 + (long) maxSec * RATE * 2)) copy(src, dst);
                 else convert(src, dst);
                 out.add(dst);
                 log.log("  converted " + base);
@@ -115,7 +127,8 @@ final class Sounds {
         byte[] hdr = new byte[44];
         try (java.io.BufferedOutputStream o = new java.io.BufferedOutputStream(new FileOutputStream(tmp), 1 << 16)) {
             o.write(hdr);
-            while (!outDone) {
+            long limit = maxSec > 0 ? (long) maxSec * RATE : Long.MAX_VALUE;
+            while (!outDone && written < limit) {
                 if (!inDone) {
                     int ii = dec.dequeueInputBuffer(10000);
                     if (ii >= 0) {
@@ -148,7 +161,7 @@ final class Sounds {
                         if (inIdx > 0) {
                             // outputs whose position falls in [inIdx-1, inIdx)
                             double p;
-                            while ((p = written * step) < inIdx) {
+                            while ((p = written * step) < inIdx && written < limit) {
                                 float fr = (float) (p - (inIdx - 1));
                                 writeSample(o, prev * (1 - fr) + cur * fr);
                                 written++;
@@ -163,7 +176,7 @@ final class Sounds {
             }
             // tail: same length the old code produced (count * RATE / rate)
             long count = inIdx + 1;
-            long outN = count * RATE / Math.max(1, rate);
+            long outN = Math.min(limit, count * RATE / Math.max(1, rate));
             while (written < outN) { writeSample(o, last); written++; }
         } catch (Throwable t) {
             tmp.delete();
@@ -180,9 +193,22 @@ final class Sounds {
          .putInt(0x20746d66).putInt(16).putShort((short) 1).putShort((short) 1)
          .putInt(RATE).putInt(RATE * 2).putShort((short) 2).putShort((short) 16)
          .putInt(0x61746164).putInt(dataLen);
-        try (RandomAccessFile r = new RandomAccessFile(tmp, "rw")) { r.seek(0); r.write(hdr); }
+        try (RandomAccessFile r = new RandomAccessFile(tmp, "rw")) {
+            r.seek(0); r.write(hdr);
+            // cut short: fade the last 60 ms out so it doesn't end on a click
+            if (maxSec > 0 && written >= limitOf()) {
+                int n = (int) Math.min(written, RATE * 60L / 1000);
+                byte[] b = new byte[n * 2];
+                r.seek(44 + (written - n) * 2); r.readFully(b);
+                ByteBuffer bb = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN);
+                for (int i = 0; i < n; i++) bb.putShort(i * 2, (short) (bb.getShort(i * 2) * (n - i) / n));
+                r.seek(44 + (written - n) * 2); r.write(b);
+            }
+        }
         if (!tmp.renameTo(dst)) throw new Exception("couldn't write " + dst);
     }
+
+    static long limitOf() { return maxSec > 0 ? (long) maxSec * RATE : Long.MAX_VALUE; }
 
     private static void writeSample(java.io.OutputStream o, float v) throws java.io.IOException {
         int s = Math.max(-32768, Math.min(32767, Math.round(v * 32767f)));

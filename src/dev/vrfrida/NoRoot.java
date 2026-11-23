@@ -68,6 +68,30 @@ final class NoRoot {
         return false;
     }
 
+    static final String VERSION_LIB = ABI_DIR + "libvrfrida-version.so";
+
+    /** this app's version code (written into every patch) */
+    static long appVersion(Context c) {
+        try { PackageInfo pi = c.getPackageManager().getPackageInfo(c.getPackageName(), 0); return Build.VERSION.SDK_INT >= 28 ? pi.getLongVersionCode() : pi.versionCode; }
+        catch (Exception e) { return 0; }
+    }
+
+    /** vrfrida version that patched this game: 0 = not patched, -1 = patched by an older version that wrote no marker */
+    static long patchVersion(ApplicationInfo ai) {
+        boolean gadget = false;
+        for (String apk : Bridge.apks(ai)) {
+            try (ZipFile z = new ZipFile(apk)) {
+                ZipEntry v = z.getEntry(VERSION_LIB);
+                if (v != null) try (InputStream in = z.getInputStream(v)) {
+                    String t = new String(in.readAllBytes(), StandardCharsets.UTF_8).replaceAll("[^0-9]", "");
+                    if (!t.isEmpty()) return Long.parseLong(t);
+                }
+                if (z.getEntry(ABI_DIR + GADGET) != null) gadget = true;
+            } catch (Exception ignored) {}
+        }
+        return gadget ? -1 : 0;
+    }
+
     /** true if the installed copy is signed with our patch key (so a repatch installs as an update) */
     boolean signedByUs(String pkg) {
         try {
@@ -246,6 +270,8 @@ final class NoRoot {
         add.put(ABI_DIR + "libfrida-gadget.config.so", gadgetConfig(cfg.v8));
         add.put(ABI_DIR + "libvrfrida-loader.js.so", loader(pkg, cfg.delay).getBytes(StandardCharsets.UTF_8));
         add.put(ABI_DIR + "libvrfrida-agent.js.so", agent.getBytes(StandardCharsets.UTF_8));
+        // which vrfrida made this patch: the games list says "repatch needed" once the app is newer
+        add.put(VERSION_LIB, (appVersion(act) + "\n").getBytes(StandardCharsets.UTF_8));
 
         List<File> result = new ArrayList<>();
         int i = 0;

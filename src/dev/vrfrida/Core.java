@@ -133,6 +133,7 @@ final class Core {
 
         boolean wantsSounds = false;
         for (File p : plugins) if (Files.head(p, 400).contains("__RASP_SOUNDBOARD")) wantsSounds = true;
+        if (micGames.contains(pkg)) wantsSounds = true;   // the menu's built-in mic soundboard, turned on for this game
         int nSounds = -1;
         if (sounds && wantsSounds) {
             List<File> wavs = Sounds.prepare(pkg, log);
@@ -156,8 +157,21 @@ final class Core {
         if (nPatterns >= 0) log.log("patterns: " + nPatterns);
     }
 
-    /** some plugin for this game reads __RASP_SOUNDBOARD (same test syncGameFiles uses) */
+    /** games with the built-in mic soundboard turned on (Games tab): they get the sounds even with no soundboard plugin */
+    static volatile java.util.Set<String> micGames = new java.util.HashSet<>();
+
+    static void loadMicGames(android.content.Context c) { micGames = new java.util.HashSet<>(Settings.prefs(c).getStringSet("micGames", new java.util.HashSet<>())); }
+
+    static void setMicGame(android.content.Context c, String pkg, boolean on) {
+        java.util.Set<String> s = new java.util.HashSet<>(micGames);
+        if (on) s.add(pkg); else s.remove(pkg);
+        micGames = s;
+        Settings.prefs(c).edit().putStringSet("micGames", s).apply();
+    }
+
+    /** some plugin for this game reads __RASP_SOUNDBOARD (same test syncGameFiles uses), or its mic soundboard is on */
     static boolean wantsSounds(String pkg) {
+        if (micGames.contains(pkg)) return true;
         for (File p : pluginsFor(pkg, null, null)) if (Files.head(p, 400).contains("__RASP_SOUNDBOARD")) return true;
         return false;
     }
@@ -552,9 +566,12 @@ final class Core {
                 "  pid=$(pidof " + APPSAFETY + " 2>/dev/null | tr ' ' '\\n' | head -1)\n" +
                 "  if [ -n \"$pid\" ] && [ \"$pid\" != \"$last\" ]; then\n" +
                 "    echo \"[appsafety] $(date '+%H:%M:%S') injecting into pid $pid\" >> \"$LOG\"\n" +
-                "    " + Root.q(injector()) + " -p $pid -s " + Root.q(spoofScript().getPath()) + " -R v8 -e < /dev/null >> \"$LOG\" 2>&1\n" +
-                "    echo \"[appsafety] $(date '+%H:%M:%S') frida-inject exited ($?)\" >> \"$LOG\"\n" +
-                "    last=\"$pid\"\n" +
+                "    if " + Root.q(injector()) + " -p $pid -s " + Root.q(spoofScript().getPath()) + " -R v8 -e < /dev/null >> \"$LOG\" 2>&1; then\n" +
+                "      echo \"[appsafety] $(date '+%H:%M:%S') spoof eternalized\" >> \"$LOG\"\n" +
+                "      last=\"$pid\"\n" +                 // only advance once the inject lands - a double Java bridge breaks auth
+                "    else\n" +
+                "      echo \"[appsafety] $(date '+%H:%M:%S') frida-inject failed (pid $pid), retrying in 2s\" >> \"$LOG\"\n" +
+                "    fi\n" +
                 "  fi\n" +
                 "  [ -z \"$pid\" ] && last=\"\"\n" +   // appsafety died: re-inject when it comes back
                 "  sleep 2\n" +
