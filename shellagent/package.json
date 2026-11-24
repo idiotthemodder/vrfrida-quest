@@ -1,0 +1,6 @@
+{
+  "name": "vrfrida-shellagent",
+  "private": true,
+  "description": "frida agent injected into com.oculus.vrshell (hides the Quest cursor over vrfrida); compiled by build.sh",
+  "dependencies": { "frida-java-bridge": "7.1.0" }
+}

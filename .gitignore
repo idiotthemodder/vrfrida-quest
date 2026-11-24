@@ -6,3 +6,6 @@ dl/
 # signing keys: NEVER commit
 *.keystore
 patchkey/
+# shellagent npm deps (build.sh installs them)
+shellagent/node_modules/
+shellagent/package-lock.json

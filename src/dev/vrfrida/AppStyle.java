@@ -29,8 +29,8 @@ final class AppStyle {
     static final String[] BGS = {"off", "aurora", "particles", "waves", "grid", "menu"};
     static final String[] BG_LABELS = {"Off (flat)", "Aurora", "Particles", "Waves", "Synthwave grid", "Synced menu background"};
 
-    static final String[] PACKS = {"soft", "retro", "glass", "bubble"};
-    static final String[] PACK_LABELS = {"Soft", "Retro (8-bit)", "Glass", "Bubble"};
+    static final String[] PACKS = {"soft", "glass", "wood", "minimal", "scifi", "bubble", "retro"};
+    static final String[] PACK_LABELS = {"Soft (marimba)", "Glass (bells)", "Wood (plucked)", "Minimal (quiet taps)", "Sci-fi", "Bubble", "Retro (8-bit)"};
 
     static final String[] CURSORS = {"off", "dot", "ring", "crosshair", "arrow", "reticle", "diamond"};
     static final String[] CURSOR_LABELS = {"Off (Quest pointer only)", "Dot", "Ring", "Crosshair", "Arrow", "Reticle", "Diamond"};
@@ -61,14 +61,14 @@ final class AppStyle {
     boolean motion() { return o.optBoolean("motion", true); }
     float motionSpeed() { return (float) clamp(o.optDouble("motionSpeed", 1), 0.3, 3); }
     boolean sfx() { return o.optBoolean("sfx", true); }
-    float sfxVol() { return (float) clamp(o.optDouble("sfxVol", 0.5), 0, 1); }
+    float sfxVol() { return (float) clamp(o.optDouble("sfxVol", 0.35), 0, 1); }
     String sfxPack() { return pick(PACKS, "sfxPack", "soft"); }
-    boolean sfxHover() { return o.optBoolean("sfxHover", true); }
+    boolean sfxHover() { return o.optBoolean("sfxHover", false); }
     String cursor() { return pick(CURSORS, "cursor", "ring"); }
     int cursorSize() { return (int) clamp(o.optInt("cursorSize", 20), 8, 48); }
     String cursorColor() { return pick(CURSOR_COLORS, "cursorColor", "accent"); }
     boolean cursorTrail() { return o.optBoolean("cursorTrail", false); }
-    boolean hidePointer() { return o.optBoolean("hidePointer", false); }
+    boolean hidePointer() { return o.optBoolean("hidePointer", true); }
     String boot() { return pick(BOOTS, "boot", "orbit"); }
 
     Typeface typeface(boolean medium) {

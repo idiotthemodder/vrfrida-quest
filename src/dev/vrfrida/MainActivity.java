@@ -145,7 +145,8 @@ public class MainActivity extends Activity {
         ui.post(poll);
         // throttled: a Magisk toast / notification pauses + resumes us, and refreshing calls su again (which toasts again)
         long now = System.currentTimeMillis();
-        if (rootOk && now - lastResumeRefresh > 15000) { lastResumeRefresh = now; io.execute(this::refreshStatus); }
+        // throttled with the status refresh: su on every resume can loop with Magisk's toast
+        if (rootOk && now - lastResumeRefresh > 15000) { lastResumeRefresh = now; io.execute(this::refreshStatus); syncQuestPointer(); }
     }
     long lastResumeRefresh = System.currentTimeMillis();
     String shownSig = "";
@@ -182,6 +183,7 @@ public class MainActivity extends Activity {
         look.bitmaps.clear();          // pattern pngs exist now
         if (rootOk && !new File(core.injector()).isFile()) log("frida-inject is missing from the app (" + core.injector() + "), rebuild the apk");
         if (rootOk) core.syncLibWatcher();
+        if (rootOk) ui.post(this::syncQuestPointer);
         scanGames();
     }
 
@@ -422,6 +424,7 @@ public class MainActivity extends Activity {
         flushSave();
         Game g = sel;
         setBusy(true);
+        sfx.play("start");
         log("── " + what + ": " + g.label);
         // the settings.json save runs on io; wait for it so the menu reads the new settings
         io.execute(() -> bg.execute(() -> {
@@ -1030,7 +1033,7 @@ public class MainActivity extends Activity {
         b.setTypeface(medium());
         b.setLetterSpacing(0.01f);
         b.setBackground(ripple(rr(bg, 20), fg));
-        b.setOnClickListener(v -> { if (!sfx.playedWithin(80)) sfx.play("click"); if (l != null) l.onClick(v); });
+        b.setOnClickListener(v -> { if (l != null) l.onClick(v); if (!sfx.playedWithin(80)) sfx.play("click"); });   // a handler's own sound wins
         pressMotion(b);
         b.setClickable(true);
         b.setFocusable(true);
@@ -1046,6 +1049,7 @@ public class MainActivity extends Activity {
         TextView b = button(label, false, l, true);
         b.setBackground(ripple(rr(m3("errorContainer"), 20), m3("onErrorContainer")));
         b.setTextColor(m3("onErrorContainer"));
+        b.setOnClickListener(v -> { sfx.play("delete"); if (l != null) l.onClick(v); });
         return b;
     }
 
@@ -1150,6 +1154,7 @@ public class MainActivity extends Activity {
                 double v = min + (max - min) * p / s.getMax();
                 v = decimals == 0 ? Math.round(v) : Math.round(v * Math.pow(10, decimals)) / Math.pow(10, decimals);
                 val.setText(fmt(v, decimals));
+                sfx.tick((double) p / s.getMax());
                 set.accept(v);
             }
             @Override public void onStartTrackingTouch(SeekBar s) {}
@@ -1167,6 +1172,7 @@ public class MainActivity extends Activity {
         t.setPadding(dp(16), dp(10), dp(14), dp(10));
         t.setOnClickListener(anchor -> {
             sfx.play("open");
+            final boolean[] chosen = {false};
             LinearLayout list = vbox();
             list.setPadding(dp(4), dp(4), dp(4), dp(4));
             ScrollView sv = new ScrollView(this);
@@ -1180,10 +1186,11 @@ public class MainActivity extends Activity {
                 TextView o = text(labels[i], 15, i == index ? m3("onSecondaryContainer") : m3("onSurface"));
                 o.setPadding(dp(16), dp(12), dp(16), dp(12));
                 o.setBackground(ripple(rr(i == index ? m3("secondaryContainer") : 0, 8), m3("onSurface")));
-                o.setOnClickListener(x -> { sfx.play("click"); pw.dismiss(); set.accept(k); });
+                o.setOnClickListener(x -> { chosen[0] = true; sfx.play("select"); pw.dismiss(); set.accept(k); });
                 list.addView(o, lp(-1, -2, 0));
             }
             if (st.motion()) pw.setAnimationStyle(android.R.style.Animation_Dialog);
+            pw.setOnDismissListener(() -> { if (!chosen[0]) sfx.play("close"); });
             pw.showAsDropDown(anchor);
         });
         return t;
@@ -1257,6 +1264,7 @@ public class MainActivity extends Activity {
         t.addView(tt, lp(0, -2, 1));
         // Refresh also picks up a new PC sync (logo, patterns, plugins) without restarting the app
         t.addView(withIcon(outlinedButton("Refresh", v -> {
+            sfx.play("refresh");
             logo = null; look.bitmaps.clear();
             io.execute(this::scanGames);
             if (tab == 2) loadStore();
@@ -1407,7 +1415,7 @@ public class MainActivity extends Activity {
         if (tabScroll != null) scrollY[tab] = tabScroll.getScrollY();
         motionDir = k > tab ? 1 : -1;
         tab = k;
-        sfx.play("tab");
+        sfx.tab(k);
         animateNext = true; navAnim = true;
         rebuild();
     }
@@ -1958,6 +1966,11 @@ public class MainActivity extends Activity {
         e.setBackground(rr(m3("surfaceContainerHighest"), 12));
         e.setPadding(dp(16), dp(12), dp(16), dp(12));
         e.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(maxLen)});
+        e.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) { if (b != c) sfx.play(c > b ? "key" : "tick", 0.7f, c > b ? 1f : 0.8f); }
+            @Override public void afterTextChanged(Editable s) {}
+        });
         return e;
     }
 
@@ -2385,6 +2398,7 @@ public class MainActivity extends Activity {
     void copyText(String label, String s) {
         android.content.ClipboardManager cm = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
         cm.setPrimaryClip(android.content.ClipData.newPlainText(label, s));
+        sfx.play("copy");
         log("copied " + label + " to the clipboard (" + s.length() + " chars)");
     }
 
@@ -2687,9 +2701,7 @@ public class MainActivity extends Activity {
 
     /** the window: animated background, the tab UI (rebuilt), cursor on top. Built once, rebuild() only swaps the slot */
     void buildHost() {
-        host = new FrameLayout(this) {
-            @Override public boolean onInterceptHoverEvent(MotionEvent e) { return false; }
-        };
+        host = new FrameLayout(this);
         appBg = new AppBgView(this);
         host.addView(appBg, new FrameLayout.LayoutParams(-1, -1));
         appMenuBg = new MenuBgView(this, look, new MenuBgView.Source() {
@@ -2713,10 +2725,20 @@ public class MainActivity extends Activity {
         appMenuBg.setVisibility(bgk.equals("menu") ? View.VISIBLE : View.GONE);
         appMenuBg.setAlpha(st.bgStrength());
         cursor.style(st.cursor(), st.cursorSize(), st.cursorColor(), st.cursorTrail(), m3("primary"), m3("tertiary"));
-        android.view.PointerIcon pi = st.hidePointer() && !st.cursor().equals("off")
-                ? android.view.PointerIcon.getSystemIcon(this, android.view.PointerIcon.TYPE_NULL) : null;
-        host.setPointerIcon(pi);
-        slot.setPointerIcon(pi);
+    }
+
+    /** hide / show the Quest's own cursor over this app (root: agent in vrshell, see Core.shellCursor) */
+    void syncQuestPointer() {
+        if (!rootOk) return;
+        boolean want = st.hidePointer() && !st.cursor().equals("off");
+        io.execute(() -> {
+            String tok = "";
+            if (want) for (int i = 0; i < 10 && (tok = Core.ownPanelToken(getPackageName())).isEmpty(); i++) {
+                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+            }
+            if (want && tok.isEmpty()) { log("Quest pointer: couldn't find this app's panel, the Quest cursor stays"); return; }
+            core.shellCursor(tok);
+        });
     }
 
     void configureSfx(boolean bootSound) {
@@ -2731,7 +2753,7 @@ public class MainActivity extends Activity {
         if (boot != null) return;
         if (S == null) colorsNow();
         boot = new BootView(this, st.boot().equals("off") ? "orbit" : st.boot(), S,
-                () -> lastLine.isEmpty() ? status : lastLine, () -> { boot = null; enterMotion(tabScroll != null ? tabScroll.getChildAt(0) : null); });
+                () -> lastLine.isEmpty() ? status : lastLine, () -> { boot = null; sfx.play("whoosh"); enterMotion(tabScroll != null ? tabScroll.getChildAt(0) : null); });
         host.addView(boot, new FrameLayout.LayoutParams(-1, -1));
         configureSfx(withSound);
     }
@@ -2818,7 +2840,7 @@ public class MainActivity extends Activity {
     @Override public boolean dispatchGenericMotionEvent(MotionEvent e) {
         try {
             int a = e.getActionMasked();
-            if (a == MotionEvent.ACTION_HOVER_MOVE || a == MotionEvent.ACTION_HOVER_ENTER) pointerAt(e.getX(), e.getY(), false);
+            if (a == MotionEvent.ACTION_HOVER_MOVE || a == MotionEvent.ACTION_HOVER_ENTER) { pointerAt(e.getX(), e.getY(), false); }
             else if (a == MotionEvent.ACTION_HOVER_EXIT) { cursor.exit(); hoverView = null; appBg.px = -1; }
         } catch (Throwable ignored) {}
         return super.dispatchGenericMotionEvent(e);
@@ -2849,6 +2871,7 @@ public class MainActivity extends Activity {
     // ================================================================ Customize tab
     void styleChanged(boolean rebuild) {
         appLookChanged(false);
+        syncQuestPointer();
         configureSfx(false);
         if (rebuild) rebuild(); else applyHostStyle();
     }
@@ -2943,19 +2966,21 @@ public class MainActivity extends Activity {
         d.addView(sChoice("Sound pack", "sfxPack", AppStyle.PACKS, AppStyle.PACK_LABELS, st.sfxPack(), false));
         d.addView(sSlider("Volume", "sfxVol", st.sfxVol(), 0, 1, 2, false));
         d.addView(sBool("Hover ticks", "sfxHover", st.sfxHover(), "soft tick when the pointer moves onto a button", false));
-        LinearLayout test = hbox();
-        for (String n : new String[]{"click", "tab", "on", "success", "error", "boot"}) {
-            TextView b = outlinedButton(n, v -> ui.postDelayed(() -> sfx.play(n), 90), false);
+        LinearLayout test = null;
+        for (int i = 0; i < UiSfx.NAMES.length; i++) {
+            if (i % 5 == 0) { test = new LinearLayout(this); test.setOrientation(LinearLayout.HORIZONTAL); d.addView(test, lp(-1, -2, 0)); }
+            String n = UiSfx.NAMES[i];
+            TextView b = outlinedButton(n, v -> ui.postDelayed(() -> { if (n.equals("tab")) sfx.tab((int) (System.currentTimeMillis() / 700 % 10)); else sfx.play(n); }, 90), false);
             test.addView(b, lpm(0, -2, 1, 3));
         }
-        d.addView(test);
 
         d.addView(section("Cursor"));
         d.addView(sChoice("Cursor", "cursor", AppStyle.CURSORS, AppStyle.CURSOR_LABELS, st.cursor(), false));
         d.addView(sSlider("Cursor size", "cursorSize", st.cursorSize(), 8, 48, 0, false));
         d.addView(sChoice("Cursor color", "cursorColor", AppStyle.CURSOR_COLORS, AppStyle.CURSOR_COLOR_LABELS, st.cursorColor(), false));
         d.addView(sBool("Trail", "cursorTrail", st.cursorTrail(), "fading dots behind the cursor", false));
-        d.addView(sBool("Hide system pointer", "hidePointer", st.hidePointer(), "asks Android to hide its pointer (Horizon OS may still draw its own ray dot)", false));
+
+        d.addView(sBool("Hide Quest pointer" + (rootOk ? "" : " (needs root)"), "hidePointer", st.hidePointer(), "hides the Quest's own dot over this app only (a small agent in the system shell), so just your cursor shows", false));
 
         d.addView(section("Boot screen"));
         d.addView(sChoice("Boot animation", "boot", AppStyle.BOOTS, AppStyle.BOOT_LABELS, st.boot(), false));

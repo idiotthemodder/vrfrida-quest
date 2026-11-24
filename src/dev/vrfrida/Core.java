@@ -591,6 +591,61 @@ final class Core {
         if (say) log.log(r.out.contains("stopped") ? "appsafety spoof watcher stopped (already-spoofed appsafety stays spoofed until it restarts)" : "no appsafety spoof watcher was running");
     }
 
+    // ---- hide the Quest's own cursor over this app (root) -----------------------------------------------
+    // An eternalized agent in com.oculus.vrshell scales the shell's cursor to 0 on the panel whose window token is in
+    // the system property debug.vrfrida.cursor (shellagent/vrshell_cursor.js). A detached root watcher injects it
+    // whenever vrshell (re)starts; the app only sets / clears the property.
+    static final String VRSHELL = "com.oculus.vrshell", CURSOR_PROP = "debug.vrfrida.cursor";
+    static File shellCursorScript() { return new File(Paths.ROOT, "vrshell_cursor.js"); }
+    static File shellCursorPidFile() { return new File(Paths.RUN, "vrshell_cursor.pid"); }
+    static File shellCursorInjected() { return new File(Paths.RUN, "vrshell_cursor.injected"); }
+    static File shellCursorLog() { return new File(Paths.LOGS, "vrshell_cursor.log"); }
+
+    /** this app's panel token (persistableToken of its volumetric window), "" if Horizon hasn't registered it yet */
+    static String ownPanelToken(String pkg) {
+        Root.Result r = Root.sh("dumpsys volumetric_window 2>/dev/null | awk '/" + pkg.replace(".", "\\.") + "\\/.* bounds=/{f=1} f&&/windowSpace: WindowSpace/{match($0,/uuid=[0-9a-f-]+/); print substr($0,RSTART+5,RLENGTH-5); exit}'");
+        String u = r.out.trim();
+        return u.matches("[0-9a-f-]{36}") ? u : "";
+    }
+
+    /** turn it on (token = this app's panel) or off (token = ""); starts the vrshell watcher when needed */
+    void shellCursor(String token) {
+        Root.sh("setprop " + CURSOR_PROP + " " + (token.isEmpty() ? "\"\"" : token));
+        if (token.isEmpty()) return;
+        String inj = shellCursorInjected().getPath();
+        String script =
+                "LOG=" + Root.q(shellCursorLog().getPath()) + "\n" +
+                "echo $$ > " + Root.q(shellCursorPidFile().getPath()) + "\n" +
+                "echo \"[vrshell] $(date '+%H:%M:%S') watcher started\" >> \"$LOG\"\n" +
+                "while kill -0 $$ 2>/dev/null; do\n" +
+                "  pid=$(pidof " + VRSHELL + " 2>/dev/null | tr ' ' '\\n' | head -1)\n" +
+                "  done_pid=$(cat " + Root.q(inj) + " 2>/dev/null)\n" +
+                "  if [ -n \"$pid\" ] && [ \"$pid\" != \"$done_pid\" ]; then\n" +
+                "    sleep 3\n" +                    // a fresh shell needs a moment before its Java side is up
+                "    echo \"[vrshell] $(date '+%H:%M:%S') injecting into pid $pid\" >> \"$LOG\"\n" +
+                "    if " + Root.q(injector()) + " -p $pid -s " + Root.q(shellCursorScript().getPath()) + " -R v8 -e < /dev/null >> \"$LOG\" 2>&1; then\n" +
+                "      echo $pid > " + Root.q(inj) + "\n" +
+                "    else echo \"[vrshell] $(date '+%H:%M:%S') frida-inject failed, retrying\" >> \"$LOG\"; fi\n" +
+                "  fi\n" +
+                "  sleep 3\n" +
+                "done\n";
+        File f = new File(Paths.RUN, "vrshell_cursor.sh");
+        // the script has this install's injector path in it: an app update changes it, so a watcher started by an older
+        // install (stale path) is replaced; an up-to-date running one is left alone
+        String pf = Root.q(shellCursorPidFile().getPath());
+        Root.Result alive = Root.sh("p=$(cat " + pf + " 2>/dev/null); [ -n \"$p\" ] && kill -0 $p 2>/dev/null && echo yes");
+        String old = "";
+        try { old = new String(Files.read(f), StandardCharsets.UTF_8); } catch (Exception ignored) {}
+        if (alive.out.trim().equals("yes") && old.equals(script)) return;
+        Root.sh("p=$(cat " + pf + " 2>/dev/null); if [ -n \"$p\" ] && kill -0 $p 2>/dev/null; then pkill -P $p; kill $p; fi");
+        try {
+            Files.write(shellCursorScript(), Files.readAsset(ctx, "vrshell_cursor.js").getBytes(StandardCharsets.UTF_8));
+            Files.write(f, script.getBytes(StandardCharsets.UTF_8));
+        } catch (Exception e) { log.log("couldn't write the vrshell cursor files: " + e); return; }
+        Root.sh("chmod 755 " + Root.q(injector()) + " 2>/dev/null; setsid sh " + Root.q(f.getPath()) + " < /dev/null > /dev/null 2>&1 &");
+        log.log("Quest pointer: vrshell watcher started (the shell's cursor is hidden over vrfrida)");
+    }
+
     // ---- the menu's settings.json in the game's files folder (root: Android/data is off limits otherwise) ----
     static String settingsPath(String pkg) { return Paths.gameFiles(pkg) + "/settings.json"; }
 
