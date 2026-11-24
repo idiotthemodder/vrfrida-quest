@@ -22,6 +22,16 @@ build time and saves the colors / generated textures into the apk, so it stays i
   integrity at startup still authenticate on a rooted headset. On by default per game; `Launch + inject` / `Inject now`
   arm it automatically. A detached root watcher injects the eternalized spoof (`assets/appsafety_spoof.js`) whenever
   appsafety (re)spawns, so it survives game restarts. Buttons: `Spoof appsafety now` / `Stop auth spoof`. Log: `logs/appsafety.log`.
+- **Customize** (the app itself, `applook` pref): theme presets (Auto / Meta / UXpatcher / Violet / Rose / Emerald /
+  Sunset / Ocean / Crimson / Gold / Mono / custom hue) in Dark / AMOLED / Light, navigation (rail left / right, tabs top /
+  bottom, labels on/off), UI size, corner roundness, font, animated app background (aurora, particles, waves, synthwave
+  grid, or the synced menu background), motion on/off + speed, UI sounds (4 packs synthesized at runtime by `UiSfx.java`,
+  no audio files), custom cursor (dot / ring / crosshair / arrow / reticle / diamond, size, color, trail), boot animation
+  (orbit / glitch / pulse / off). "Copy style code" / "Paste style code" shares a look as a `vrstyle:` string.
+- **Tools** (root): VR runtime props (refresh rate, CPU / GPU level, render resolution, fixed foveation; apply to apps
+  started afterwards, reset on reboot), Wi-Fi ADB on :5555, proximity sensor off, SELinux, screenshot to
+  `/sdcard/vrfrida/captures/`, force stop / clear cache / process info for the selected game, storage use + cleanup,
+  root shell with output.
 - **App Look**: app theme = the selected game's menu (theme + background follow whatever game you pick),
   UXpatcher (its bg / accent / text colors through the menu's colorsFromRGB), or any menu theme with the app's own background.
 

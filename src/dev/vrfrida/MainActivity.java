@@ -27,6 +27,7 @@ import android.provider.Settings;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.EditText;
@@ -54,7 +55,8 @@ import java.util.concurrent.Executors;
 
 /** the app, drawn to look like UniversalMenu (same themes, backgrounds and widgets) */
 public class MainActivity extends Activity {
-    static final String[] TABS = {"Games", "Plugins", "Store", "Menu Look", "Log", "Info", "Logcat", "Mic"};
+    static final String[] TABS = {"Games", "Plugins", "Store", "Menu Look", "Log", "Info", "Logcat", "Mic", "Tools", "Customize"};
+    static final int TAB_TOOLS = 8, TAB_CUSTOMIZE = 9;
 
     static final class Game {
         ApplicationInfo ai; String label; Bitmap icon; String fp = ""; String bridge = "?"; boolean running, injected, fav, patched, outdated; long patchVer;
@@ -101,7 +103,7 @@ public class MainActivity extends Activity {
         String want = "";
         try { want = new String(Files.read(trig), "UTF-8").trim(); } catch (Exception ignored) {}
         trig.delete();
-        if (want.matches("[0-7]") && Integer.parseInt(want) != tab) { goTab(Integer.parseInt(want)); ui.postDelayed(() -> { try { Files.write(trig, new byte[0]); } catch (Exception ignored) {} }, 1500); return; }
+        if (want.matches("[0-9]") && Integer.parseInt(want) != tab) { goTab(Integer.parseInt(want)); ui.postDelayed(() -> { try { Files.write(trig, new byte[0]); } catch (Exception ignored) {} }, 1500); return; }
         try {
             View v = getWindow().getDecorView();
             Bitmap b = Bitmap.createBitmap(v.getWidth(), v.getHeight(), Bitmap.Config.ARGB_8888);
@@ -126,11 +128,14 @@ public class MainActivity extends Activity {
         look = new MenuLook(this);
         appLook = MenuCfg.parse(look, dev.vrfrida.Settings.prefs(this).getString("applook", "{}"));
         globalCfg = MenuCfg.parse(look, dev.vrfrida.Settings.globalLook(this));
-        String th = appLook.root.optString("appTheme", "auto");
-        if (!th.equals("meta") && !th.equals("uxpatcher")) { try { appLook.root.put("appTheme", "auto"); } catch (Exception ignored) {} }
+        st = new AppStyle(appLook.root);
+        sfx = new UiSfx(this);
         uxpKey = uxpSignature();
+        buildHost();
         rebuild();
-        bg.execute(this::startup);
+        if (b == null && !st.boot().equals("off")) showBoot(true);
+        else configureSfx(false);
+        bg.execute(() -> { try { startup(); } finally { ui.post(this::bootReady); } });
     }
 
     @Override protected void onResume() {
@@ -393,7 +398,7 @@ public class MainActivity extends Activity {
 
     /** app colors: Material 3, from UXpatcher when it's installed (or chosen), else Meta blue */
     Map<String, float[]> colorsNow() {
-        S = M3.scheme(this, appTheme());
+        S = st.scheme(this);
         return M3.legacy(S);
     }
 
@@ -423,7 +428,7 @@ public class MainActivity extends Activity {
             boolean ok = false;
             try { j.run(g); ok = true; }
             catch (Throwable e) { log("error: " + e); }
-            finally { if (!(ok && keepBusy)) ui.post(() -> setBusy(false)); refreshStatus(); }
+            finally { boolean fok = ok; if (!(ok && keepBusy)) ui.post(() -> setBusy(false)); ui.post(() -> sfx.play(fok ? "success" : "error")); refreshStatus(); }
         }));
     }
 
@@ -767,6 +772,7 @@ public class MainActivity extends Activity {
         if (noRoot != null) noRoot.close();
         logcat.stop();
         if (updater != null) updater.close();
+        if (sfx != null) sfx.release();
         super.onDestroy();
     }
 
@@ -803,7 +809,7 @@ public class MainActivity extends Activity {
         repo.setSingleLine(true);
         repo.setHint("owner/repo on GitHub");
         repo.setText(Updater.repo(this));
-        repo.setTextSize(15);
+        repo.setTextSize(15 * st.uiScale());
         repo.setTextColor(col("Text"));
         repo.setHintTextColor(col("TextDisabled"));
         repo.setBackground(rr(m3("surfaceContainerHighest"), 12));
@@ -831,6 +837,7 @@ public class MainActivity extends Activity {
     // ================================================================ log
     void log(String s) {
         android.util.Log.i("vrfrida", s);
+        lastLine = s;
         String line = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date()) + "  " + s;
         synchronized (appLog) {
             appLog.append(line).append('\n');
@@ -883,14 +890,14 @@ public class MainActivity extends Activity {
     }
 
     // ================================================================ widgets in the menu's style
-    int dp(float v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+    int dp(float v) { return Math.round(v * getResources().getDisplayMetrics().density * (st == null ? 1f : st.uiScale())); }
 
     float rounding() { return 12f; }      // M3 medium shape
 
     GradientDrawable rr(int color, float radiusDp) {
         GradientDrawable d = new GradientDrawable();
         d.setColor(color);
-        d.setCornerRadius(dp(radiusDp));
+        d.setCornerRadius(dp(radiusDp * (st == null ? 1f : st.corners())));
         return d;
     }
 
@@ -905,7 +912,7 @@ public class MainActivity extends Activity {
         return new android.graphics.drawable.RippleDrawable(ColorStateList.valueOf((onColor & 0x00FFFFFF) | 0x24000000), content, mask);
     }
 
-    Typeface medium() { return Typeface.create("sans-serif-medium", Typeface.NORMAL); }
+    Typeface medium() { return st.typeface(true); }
 
     /** a Material icon from res/drawable/ic_<name>.xml, tinted */
     Drawable icon(String name, int color, int sizeDp) {
@@ -942,8 +949,9 @@ public class MainActivity extends Activity {
     TextView text(CharSequence s, float sp, int color) {
         TextView t = new TextView(this);
         t.setText(s);
-        t.setTextSize(sp);
+        t.setTextSize(sp * st.uiScale());
         t.setTextColor(color);
+        t.setTypeface(st.typeface(false));
         t.setLineSpacing(0, 1.12f);
         return t;
     }
@@ -1022,7 +1030,8 @@ public class MainActivity extends Activity {
         b.setTypeface(medium());
         b.setLetterSpacing(0.01f);
         b.setBackground(ripple(rr(bg, 20), fg));
-        b.setOnClickListener(l);
+        b.setOnClickListener(v -> { if (!sfx.playedWithin(80)) sfx.play("click"); if (l != null) l.onClick(v); });
+        pressMotion(b);
         b.setClickable(true);
         b.setFocusable(true);
         b.setSingleLine(true);
@@ -1115,12 +1124,14 @@ public class MainActivity extends Activity {
             box.addView(d, lp(0, -2, 1));
         }
         box.setBackground(ripple(rr(0, 16), m3("onSurface")));
-        box.setOnClickListener(x -> { v[0] = !v[0]; sw.invalidate(); set.accept(v[0]); });
+        box.setOnClickListener(x -> { v[0] = !v[0]; sfx.play(v[0] ? "on" : "off"); sw.invalidate(); set.accept(v[0]); });
         return box;
     }
 
     /** slider: FrameBg track, SliderFill, SliderGrab thumb, value on the right */
-    View slider(double value, double min, double max, int decimals, java.util.function.Consumer<Double> set) {
+    View slider(double value, double min, double max, int decimals, java.util.function.Consumer<Double> set) { return slider(value, min, max, decimals, set, null); }
+
+    View slider(double value, double min, double max, int decimals, java.util.function.Consumer<Double> set, Runnable onRelease) {
         LinearLayout box = hbox();
         SeekBar sb = new SeekBar(this);
         int steps = decimals == 0 ? (int) Math.round(max - min) : (int) Math.round((max - min) * Math.pow(10, decimals));
@@ -1142,7 +1153,7 @@ public class MainActivity extends Activity {
                 set.accept(v);
             }
             @Override public void onStartTrackingTouch(SeekBar s) {}
-            @Override public void onStopTrackingTouch(SeekBar s) {}
+            @Override public void onStopTrackingTouch(SeekBar s) { sfx.play("click"); if (onRelease != null) ui.post(onRelease); }
         });
         return box;
     }
@@ -1155,6 +1166,7 @@ public class MainActivity extends Activity {
         t.setBackground(ripple(rr(m3("surfaceContainerHighest"), 12), m3("onSurface")));
         t.setPadding(dp(16), dp(10), dp(14), dp(10));
         t.setOnClickListener(anchor -> {
+            sfx.play("open");
             LinearLayout list = vbox();
             list.setPadding(dp(4), dp(4), dp(4), dp(4));
             ScrollView sv = new ScrollView(this);
@@ -1168,9 +1180,10 @@ public class MainActivity extends Activity {
                 TextView o = text(labels[i], 15, i == index ? m3("onSecondaryContainer") : m3("onSurface"));
                 o.setPadding(dp(16), dp(12), dp(16), dp(12));
                 o.setBackground(ripple(rr(i == index ? m3("secondaryContainer") : 0, 8), m3("onSurface")));
-                o.setOnClickListener(x -> { pw.dismiss(); set.accept(k); });
+                o.setOnClickListener(x -> { sfx.play("click"); pw.dismiss(); set.accept(k); });
                 list.addView(o, lp(-1, -2, 0));
             }
+            if (st.motion()) pw.setAnimationStyle(android.R.style.Animation_Dialog);
             pw.showAsDropDown(anchor);
         });
         return t;
@@ -1184,10 +1197,14 @@ public class MainActivity extends Activity {
         logView = null; miniLog = null; gameList = null; detailHeader = null;
         logSig = "";
 
-        LinearLayout root = hbox();
+        applyHostStyle();
+        String nav = st.nav();
+        boolean side = nav.equals("left") || nav.equals("right");
+        LinearLayout root = side ? hbox() : vbox();
         root.setGravity(Gravity.TOP);
-        root.setBackgroundColor(m3("surface"));
-        root.addView(navRail(), lp(dp(96), -1, 0));
+        root.setBackgroundColor(st.bg().equals("off") ? m3("surface") : 0);
+        if (nav.equals("left")) root.addView(navRail(), lp(dp(st.navLabels() ? 96 : 80), -1, 0));
+        if (nav.equals("top")) root.addView(navBar(), lp(-1, -2, 0));
 
         LinearLayout content = vbox();
         content.addView(titleBar());
@@ -1197,15 +1214,19 @@ public class MainActivity extends Activity {
         tabScroll = new ScrollView(this);
         tabScroll.setFillViewport(true);
         tabScroll.setVerticalScrollBarEnabled(true);
-        View body = tab == 0 ? gamesTab() : tab == 1 ? pluginsTab() : tab == 2 ? storeTab() : tab == 3 ? lookTab() : tab == 4 ? logTab() : tab == 5 ? infoTab() : tab == 6 ? logcatTab() : micTab();
+        View body = tab == 0 ? gamesTab() : tab == 1 ? pluginsTab() : tab == 2 ? storeTab() : tab == 3 ? lookTab() : tab == 4 ? logTab() : tab == 5 ? infoTab() : tab == 6 ? logcatTab() : tab == 7 ? micTab() : tab == TAB_TOOLS ? toolsTab() : customizeTab();
         tabScroll.addView(body);
         tabScroll.setPadding(dp(16), dp(8), dp(20), dp(16));
         tabScroll.setClipToPadding(false);
         content.addView(tabScroll, lp(-1, 0, 1));
-        root.addView(content, lp(0, -1, 1));
-        setContentView(root);
+        root.addView(content, side ? lp(0, -1, 1) : lp(-1, 0, 1));
+        if (nav.equals("right")) root.addView(navRail(), lp(dp(st.navLabels() ? 96 : 80), -1, 0));
+        if (nav.equals("bottom")) root.addView(navBar(), lp(-1, -2, 0));
+        slot.removeAllViews();
+        slot.addView(root, new FrameLayout.LayoutParams(-1, -1));
         final int y = scrollY[tab];
         tabScroll.post(() -> tabScroll.scrollTo(0, y));
+        if (animateNext) { animateNext = false; enterMotion(body); }
         refreshLogs();
         updateStatusLine();
     }
@@ -1243,13 +1264,13 @@ public class MainActivity extends Activity {
         return t;
     }
 
-    static final String[] TAB_ICONS = {"games", "extension", "store", "palette", "article", "bolt", "code", "mic"};
+    static final String[] TAB_ICONS = {"games", "extension", "store", "palette", "article", "bolt", "code", "mic", "terminal", "tune"};
 
     /** M3 navigation rail: icon in a pill indicator, label under it */
     View navRail() {
         LinearLayout rail = vbox();
         rail.setGravity(Gravity.CENTER_HORIZONTAL);
-        rail.setBackgroundColor(m3("surfaceContainer"));
+        boolean labels = st.navLabels();
         rail.setPadding(0, dp(14), 0, dp(14));
         TextView brand = text("vrfrida", 13, m3("primary"));
         brand.setTypeface(medium());
@@ -1262,7 +1283,7 @@ public class MainActivity extends Activity {
             boolean on = i == tab;
             LinearLayout item = vbox();
             item.setGravity(Gravity.CENTER_HORIZONTAL);
-            item.setPadding(0, dp(6), 0, dp(10));
+            item.setPadding(0, dp(6), 0, dp(labels ? 10 : 6));
             FrameLayout pill = new FrameLayout(this);
             pill.setBackground(ripple(rr(on ? m3("secondaryContainer") : 0, 16), m3("onSurface")));
             ImageView ic = iconView(TAB_ICONS[i], on ? m3("onSecondaryContainer") : m3("onSurfaceVariant"), 24);
@@ -1277,16 +1298,65 @@ public class MainActivity extends Activity {
                 pill.addView(b, bp);
             }
             item.addView(pill, new LinearLayout.LayoutParams(dp(56), dp(32)));
-            TextView lb = text(TABS[i], 12, on ? m3("onSurface") : m3("onSurfaceVariant"));
-            lb.setGravity(Gravity.CENTER);
-            if (on) lb.setTypeface(medium());
-            lb.setPadding(0, dp(4), 0, 0);
-            item.addView(lb, lp(-1, -2, 0));
+            if (on && navAnim && st.motion()) { pill.setScaleX(0.35f); pill.animate().scaleX(1f).setDuration(mt(320)).setInterpolator(new android.view.animation.OvershootInterpolator(1.6f)).start(); }
+            if (labels) {
+                TextView lb = text(TABS[i], 12, on ? m3("onSurface") : m3("onSurfaceVariant"));
+                lb.setGravity(Gravity.CENTER);
+                if (on) lb.setTypeface(medium());
+                lb.setPadding(0, dp(4), 0, 0);
+                item.addView(lb, lp(-1, -2, 0));
+            }
             item.setOnClickListener(x -> goTab(k));
             pill.setOnClickListener(x -> goTab(k));
+            pill.setTooltipText(TABS[i]);
             rail.addView(item, lp(-1, -2, 0));
         }
-        return rail;
+        navAnim = false;
+        ScrollView sv = new ScrollView(this);
+        sv.setVerticalScrollBarEnabled(false);
+        sv.setFillViewport(true);
+        sv.addView(rail);
+        sv.setBackgroundColor(m3("surfaceContainer", st.bg().equals("off") ? 1f : 0.72f));
+        return sv;
+    }
+
+    /** horizontal tab bar (Navigation: top / bottom): icon + label pills in a scrolling row */
+    View navBar() {
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setPadding(dp(10), dp(8), dp(10), dp(8));
+        TextView brand = text("vrfrida", 15, m3("primary"));
+        brand.setTypeface(medium());
+        brand.setPadding(dp(8), 0, dp(14), 0);
+        bar.addView(brand);
+        boolean labels = st.navLabels();
+        for (int i = 0; i < TABS.length; i++) {
+            final int k = i;
+            boolean on = i == tab;
+            TextView b = text(labels ? TABS[i] : "", 14, on ? m3("onSecondaryContainer") : m3("onSurfaceVariant"));
+            if (on) b.setTypeface(medium());
+            b.setGravity(Gravity.CENTER);
+            b.setSingleLine(true);
+            b.setCompoundDrawablesRelative(icon(TAB_ICONS[i], on ? m3("onSecondaryContainer") : m3("onSurfaceVariant"), 20), null, null, null);
+            b.setCompoundDrawablePadding(labels ? dp(8) : 0);
+            b.setPadding(dp(labels ? 14 : 12), dp(8), dp(labels ? 16 : 12), dp(8));
+            b.setBackground(ripple(rr(on ? m3("secondaryContainer") : 0, 18), m3("onSurface")));
+            b.setOnClickListener(x -> goTab(k));
+            b.setTooltipText(TABS[i]);
+            pressMotion(b);
+            if (on && navAnim && st.motion()) { b.setScaleX(0.6f); b.animate().scaleX(1f).setDuration(mt(300)).setInterpolator(new android.view.animation.OvershootInterpolator(1.6f)).start(); }
+            LinearLayout.LayoutParams p = lp(-2, -2, 0);
+            p.setMargins(dp(2), 0, dp(2), 0);
+            bar.addView(b, p);
+            if (on) { final View fv = b; bar.post(() -> { View sv = (View) bar.getParent(); if (sv instanceof android.widget.HorizontalScrollView) ((android.widget.HorizontalScrollView) sv).smoothScrollTo(Math.max(0, fv.getLeft() - dp(80)), 0); }); }
+        }
+        navAnim = false;
+        android.widget.HorizontalScrollView sv = new android.widget.HorizontalScrollView(this);
+        sv.setHorizontalScrollBarEnabled(false);
+        sv.addView(bar);
+        sv.setBackgroundColor(m3("surfaceContainer", st.bg().equals("off") ? 1f : 0.72f));
+        return sv;
     }
 
     // ---------------------------------------------------------------- progress (M3 linear progress indicator)
@@ -1335,7 +1405,10 @@ public class MainActivity extends Activity {
         if (tab == k) return;
         flushSave();
         if (tabScroll != null) scrollY[tab] = tabScroll.getScrollY();
+        motionDir = k > tab ? 1 : -1;
         tab = k;
+        sfx.play("tab");
+        animateNext = true; navAnim = true;
         rebuild();
     }
 
@@ -1348,7 +1421,7 @@ public class MainActivity extends Activity {
         q.setSingleLine(true);
         q.setHint("search games");
         q.setText(search);
-        q.setTextSize(15);
+        q.setTextSize(15 * st.uiScale());
         q.setTextColor(col("Text"));
         q.setHintTextColor(col("TextDisabled"));
         q.setBackground(rr(m3("surfaceContainerHighest"), 12));
@@ -1879,7 +1952,7 @@ public class MainActivity extends Activity {
         e.setSingleLine(true);
         e.setHint(hint);
         e.setText(value);
-        e.setTextSize(15);
+        e.setTextSize(15 * st.uiScale());
         e.setTextColor(col("Text"));
         e.setHintTextColor(col("TextDisabled"));
         e.setBackground(rr(m3("surfaceContainerHighest"), 12));
@@ -2027,12 +2100,7 @@ public class MainActivity extends Activity {
         }
 
         d.addView(section("This app"));
-        String[] srcs = {"Auto (" + (MenuLook.hasUxpatcher(this) ? "UXpatcher" : "Meta") + ")", "Meta", MenuLook.hasUxpatcher(this) ? "UXpatcher" : "UXpatcher (not installed)"};
-        String at = appTheme();
-        d.addView(row("App theme", combo(srcs, at.equals("meta") ? 1 : at.equals("uxpatcher") ? 2 : 0, i -> {
-            try { appLook.root.put("appTheme", i == 1 ? "meta" : i == 2 ? "uxpatcher" : "auto"); } catch (Exception ignored) {}
-            appLookChanged(true);
-        })));
+        d.addView(row("App theme, layout, sounds, cursor", withIcon(button("Open Customize", false, v -> goTab(TAB_CUSTOMIZE), false), "tune")));
         return d;
     }
 
@@ -2596,6 +2664,494 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams lp = lp(-1, -2, 0);
         lp.setMargins(0, dp(6), 0, 0);
         d.addView(logView, lp);
+        return d;
+    }
+
+    // ================================================================ app style: host window, background, cursor, boot
+    AppStyle st;
+    UiSfx sfx;
+    FrameLayout host, slot;
+    AppBgView appBg;
+    MenuBgView appMenuBg;
+    CursorView cursor;
+    BootView boot;
+    volatile String lastLine = "";
+    boolean animateNext, navAnim;
+    int motionDir = 1;
+    final ExecutorService toolsExec = Executors.newSingleThreadExecutor();   // Tools tab shell commands
+
+    int m3(String role, float alpha) { return (m3(role) & 0x00FFFFFF) | (Math.round(Math.max(0, Math.min(1, alpha)) * 255) << 24); }
+
+    /** motion duration scaled by the Motion speed setting */
+    long mt(long ms) { return Math.max(1, Math.round(ms / st.motionSpeed())); }
+
+    /** the window: animated background, the tab UI (rebuilt), cursor on top. Built once, rebuild() only swaps the slot */
+    void buildHost() {
+        host = new FrameLayout(this) {
+            @Override public boolean onInterceptHoverEvent(MotionEvent e) { return false; }
+        };
+        appBg = new AppBgView(this);
+        host.addView(appBg, new FrameLayout.LayoutParams(-1, -1));
+        appMenuBg = new MenuBgView(this, look, new MenuBgView.Source() {
+            @Override public MenuCfg cfg() { return globalCfg; }
+            @Override public Map<String, float[]> colors() { return look.colors(globalCfg.str("theme"), MainActivity.this, (float) globalCfg.root.optDouble("rainbowSpeed", 0.05)); }
+            @Override public boolean animate() { return st.bgAnimate(); }
+        });
+        host.addView(appMenuBg, new FrameLayout.LayoutParams(-1, -1));
+        slot = new FrameLayout(this);
+        host.addView(slot, new FrameLayout.LayoutParams(-1, -1));
+        cursor = new CursorView(this);
+        host.addView(cursor, new FrameLayout.LayoutParams(-1, -1));
+        setContentView(host);
+    }
+
+    /** push the current style into the long-lived views (no rebuild needed for these) */
+    void applyHostStyle() {
+        if (host == null || S == null) return;
+        String bgk = st.bg();
+        appBg.set(bgk, st.bgStrength(), st.bgSpeed(), st.bgAnimate(), m3("surface"), m3("primary"), m3("secondary"), m3("tertiary"));
+        appMenuBg.setVisibility(bgk.equals("menu") ? View.VISIBLE : View.GONE);
+        appMenuBg.setAlpha(st.bgStrength());
+        cursor.style(st.cursor(), st.cursorSize(), st.cursorColor(), st.cursorTrail(), m3("primary"), m3("tertiary"));
+        android.view.PointerIcon pi = st.hidePointer() && !st.cursor().equals("off")
+                ? android.view.PointerIcon.getSystemIcon(this, android.view.PointerIcon.TYPE_NULL) : null;
+        host.setPointerIcon(pi);
+        slot.setPointerIcon(pi);
+    }
+
+    void configureSfx(boolean bootSound) {
+        boolean on = st.sfx();
+        String pack = st.sfxPack();
+        float vol = st.sfxVol();
+        boolean hov = st.sfxHover();
+        io.execute(() -> { sfx.configure(on, pack, vol, hov); if (bootSound) sfx.playWhenReady("boot"); });
+    }
+
+    void showBoot(boolean withSound) {
+        if (boot != null) return;
+        if (S == null) colorsNow();
+        boot = new BootView(this, st.boot().equals("off") ? "orbit" : st.boot(), S,
+                () -> lastLine.isEmpty() ? status : lastLine, () -> { boot = null; enterMotion(tabScroll != null ? tabScroll.getChildAt(0) : null); });
+        host.addView(boot, new FrameLayout.LayoutParams(-1, -1));
+        configureSfx(withSound);
+    }
+
+    void bootReady() { if (boot != null) boot.ready(); }
+
+    /** M3-ish press / hover motion: shrinks while pressed, lifts a little under the pointer */
+    void pressMotion(View v) {
+        if (!st.motion()) return;
+        android.animation.StateListAnimator sla = new android.animation.StateListAnimator();
+        sla.addState(new int[]{android.R.attr.state_pressed}, scaleTo(v, 0.95f, 90));
+        sla.addState(new int[]{android.R.attr.state_hovered}, scaleTo(v, 1.035f, 160));
+        sla.addState(new int[0], scaleTo(v, 1f, 160));
+        v.setStateListAnimator(sla);
+    }
+
+    android.animation.Animator scaleTo(View v, float s, long ms) {
+        android.animation.ObjectAnimator a = android.animation.ObjectAnimator.ofPropertyValuesHolder(v,
+                android.animation.PropertyValuesHolder.ofFloat(View.SCALE_X, s), android.animation.PropertyValuesHolder.ofFloat(View.SCALE_Y, s));
+        a.setDuration(mt(ms));
+        a.setInterpolator(new android.view.animation.DecelerateInterpolator());
+        return a;
+    }
+
+    /** a tab's content comes in: children slide + fade in one after another */
+    void enterMotion(View body) {
+        if (body == null || !st.motion() || boot != null) return;
+        android.view.animation.Interpolator in = new android.view.animation.DecelerateInterpolator(2f);
+        if (body instanceof ViewGroup && ((ViewGroup) body).getChildCount() > 0) {
+            ViewGroup g = (ViewGroup) body;
+            int n = Math.min(g.getChildCount(), 16);
+            for (int i = 0; i < n; i++) {
+                View c = g.getChildAt(i);
+                c.setAlpha(0f);
+                c.setTranslationY(dp(14) * motionDir);
+                c.animate().alpha(1f).translationY(0).setStartDelay(mt(i * 26L)).setDuration(mt(300)).setInterpolator(in).start();
+            }
+        } else {
+            body.setAlpha(0f);
+            body.animate().alpha(1f).setDuration(mt(250)).start();
+        }
+    }
+
+    // ---------------------------------------------------------------- window input hooks: cursor, ui sounds
+    final int[] hostLoc = new int[2];
+    View hoverView;
+    float downX, downY;
+    boolean downMoved;
+
+    /** deepest visible, enabled, clickable view under (x, y) in v's coordinates */
+    static View clickableAt(View v, float x, float y) {
+        if (v.getVisibility() != View.VISIBLE) return null;
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = g.getChildCount() - 1; i >= 0; i--) {
+                View c = g.getChildAt(i);
+                float cx = x + g.getScrollX() - c.getLeft() - c.getTranslationX(), cy = y + g.getScrollY() - c.getTop() - c.getTranslationY();
+                if (cx >= 0 && cy >= 0 && cx < c.getWidth() && cy < c.getHeight()) {
+                    View r = clickableAt(c, cx, cy);
+                    if (r != null) return r;
+                }
+            }
+        }
+        return v.isClickable() && v.isEnabled() ? v : null;
+    }
+
+    View clickableAtWindow(float wx, float wy) {
+        if (host == null) return null;
+        host.getLocationInWindow(hostLoc);
+        View top = boot != null ? boot : slot;
+        return clickableAt(top, wx - hostLoc[0] - top.getLeft(), wy - hostLoc[1] - top.getTop());
+    }
+
+    void pointerAt(float wx, float wy, boolean pressed) {
+        if (host == null) return;
+        host.getLocationInWindow(hostLoc);
+        float x = wx - hostLoc[0], y = wy - hostLoc[1];
+        View v = clickableAtWindow(wx, wy);
+        if (v != hoverView) { if (v != null && !pressed) sfx.play("hover"); hoverView = v; }
+        cursor.move(x, y, v != null);
+        appBg.px = x; appBg.py = y;
+    }
+
+    @Override public boolean dispatchGenericMotionEvent(MotionEvent e) {
+        try {
+            int a = e.getActionMasked();
+            if (a == MotionEvent.ACTION_HOVER_MOVE || a == MotionEvent.ACTION_HOVER_ENTER) pointerAt(e.getX(), e.getY(), false);
+            else if (a == MotionEvent.ACTION_HOVER_EXIT) { cursor.exit(); hoverView = null; appBg.px = -1; }
+        } catch (Throwable ignored) {}
+        return super.dispatchGenericMotionEvent(e);
+    }
+
+    @Override public boolean dispatchTouchEvent(MotionEvent e) {
+        int a = e.getActionMasked();
+        try {
+            if (a == MotionEvent.ACTION_DOWN) {
+                downX = e.getX(); downY = e.getY(); downMoved = false;
+                pointerAt(e.getX(), e.getY(), true);
+                host.getLocationInWindow(hostLoc);
+                cursor.press(e.getX() - hostLoc[0], e.getY() - hostLoc[1]);
+            } else if (a == MotionEvent.ACTION_MOVE) {
+                if (Math.hypot(e.getX() - downX, e.getY() - downY) > dp(10)) downMoved = true;
+                pointerAt(e.getX(), e.getY(), true);
+            }
+        } catch (Throwable ignored) {}
+        boolean r = super.dispatchTouchEvent(e);
+        if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+            cursor.release();
+            if (a == MotionEvent.ACTION_UP && !downMoved && clickableAtWindow(e.getX(), e.getY()) != null)
+                ui.post(() -> { if (!sfx.playedWithin(80)) sfx.play("click"); });   // after performClick, so a widget's own sound wins
+        }
+        return r;
+    }
+
+    // ================================================================ Customize tab
+    void styleChanged(boolean rebuild) {
+        appLookChanged(false);
+        configureSfx(false);
+        if (rebuild) rebuild(); else applyHostStyle();
+    }
+
+    View sChoice(String label, String key, String[] vals, String[] labels, String cur, boolean rebuild) {
+        return row(label, combo(labels, AppStyle.index(vals, cur), i -> { st.put(key, vals[i]); styleChanged(rebuild); }));
+    }
+
+    View sBool(String label, String key, boolean cur, String desc, boolean rebuild) {
+        return row(label, checkbox(cur, desc, v -> { st.put(key, v); if (rebuild) ui.postDelayed(() -> styleChanged(true), mt(200)); else styleChanged(false); }));
+    }
+
+    /** rebuildOnRelease: the value changes layout, so the ui is rebuilt when the slider is let go (not mid-drag) */
+    View sSlider(String label, String key, double cur, double min, double max, int dec, boolean rebuildOnRelease) {
+        return row(label, slider(cur, min, max, dec, v -> { st.put(key, v); if (!rebuildOnRelease) styleChanged(false); else appLookChanged(false); },
+                rebuildOnRelease ? () -> styleChanged(true) : null));
+    }
+
+    View themeSwatches() {
+        LinearLayout all = vbox();
+        String cur = st.theme();
+        int perRow = 6;
+        LinearLayout r = null;
+        for (int i = 0; i < AppStyle.THEMES.length; i++) {
+            if (i % perRow == 0) { r = new LinearLayout(this); r.setOrientation(LinearLayout.HORIZONTAL); all.addView(r, lp(-1, -2, 0)); }
+            final String id = AppStyle.THEMES[i];
+            boolean on = id.equals(cur);
+            LinearLayout chip = vbox();
+            chip.setGravity(Gravity.CENTER_HORIZONTAL);
+            chip.setPadding(dp(6), dp(10), dp(6), dp(8));
+            int sw = AppStyle.swatch(this, id, st.hue());
+            View dot = new View(this) {
+                final Paint pp = new Paint(Paint.ANTI_ALIAS_FLAG);
+                @Override protected void onDraw(Canvas c) {
+                    float w = getWidth(), h = getHeight(), rad = Math.min(w, h) / 2 - dp(3);
+                    if (id.equals("mono")) {
+                        pp.setColor(0xFF202020); c.drawCircle(w / 2, h / 2, rad, pp);
+                        pp.setColor(0xFFE0E0E0); c.drawArc(w / 2 - rad, h / 2 - rad, w / 2 + rad, h / 2 + rad, -90, 180, true, pp);
+                    } else if (id.equals("auto")) {
+                        pp.setColor(sw); c.drawCircle(w / 2, h / 2, rad, pp);
+                        pp.setColor(0x66FFFFFF); pp.setTextSize(dp(13)); pp.setTextAlign(Paint.Align.CENTER); c.drawText("A", w / 2, h / 2 + dp(5), pp);
+                    } else { pp.setColor(sw); c.drawCircle(w / 2, h / 2, rad, pp); }
+                    if (on) { pp.setStyle(Paint.Style.STROKE); pp.setStrokeWidth(dp(2.5f)); pp.setColor(m3("onSurface")); c.drawCircle(w / 2, h / 2, rad + dp(1.5f), pp); pp.setStyle(Paint.Style.FILL); }
+                }
+            };
+            chip.addView(dot, new LinearLayout.LayoutParams(dp(40), dp(40)));
+            TextView lb = text(AppStyle.THEME_LABELS[i], 12, on ? m3("onSurface") : m3("onSurfaceVariant"));
+            lb.setGravity(Gravity.CENTER);
+            lb.setSingleLine(true);
+            lb.setPadding(0, dp(4), 0, 0);
+            chip.addView(lb, lp(-1, -2, 0));
+            chip.setBackground(ripple(rr(on ? m3("secondaryContainer") : 0, 14), m3("onSurface")));
+            chip.setOnClickListener(v -> { st.put("appTheme", id); sfx.play("on"); styleChanged(true); });
+            pressMotion(chip);
+            r.addView(chip, lpm(0, -2, 1, 3));
+        }
+        if (r != null) for (int k = AppStyle.THEMES.length % perRow; k > 0 && k < perRow; k++) r.addView(new View(this), lpm(0, 1, 1, 3));
+        return all;
+    }
+
+    View customizeTab() {
+        LinearLayout d = vbox();
+        TextView intro = text("How this app looks, moves and sounds. Saved right away, only on this headset (the in-game menu has its own look on the Menu Look tab).", 13, m3("onSurfaceVariant"));
+        intro.setPadding(dp(4), dp(4), 0, dp(4));
+        d.addView(intro);
+
+        d.addView(section("Theme"));
+        d.addView(themeSwatches());
+        if (st.theme().equals("custom")) d.addView(sSlider("Custom hue", "hue", st.hue(), 0, 359, 0, true));
+        boolean uxLocked = (st.theme().equals("auto") || st.theme().equals("uxpatcher")) && MenuLook.hasUxpatcher(this);
+        d.addView(sChoice("Mode" + (uxLocked ? " (UXpatcher decides)" : ""), "mode", AppStyle.MODES, AppStyle.MODE_LABELS, st.mode(), true));
+
+        d.addView(section("Layout"));
+        d.addView(sChoice("Navigation", "nav", AppStyle.NAV, AppStyle.NAV_LABELS, st.nav(), true));
+        d.addView(sBool("Tab labels", "navLabels", st.navLabels(), "names under the tab icons", true));
+        d.addView(sSlider("UI size", "uiScale", st.uiScale(), 0.7, 1.5, 2, true));
+        d.addView(sSlider("Corner roundness", "corners", st.corners(), 0, 2.5, 2, true));
+        d.addView(sChoice("Font", "font", AppStyle.FONTS, AppStyle.FONT_LABELS, st.font(), true));
+
+        d.addView(section("Background"));
+        d.addView(sChoice("App background", "appBg", AppStyle.BGS, AppStyle.BG_LABELS, st.bg(), true));
+        d.addView(sSlider("Strength", "bgStrength", st.bgStrength(), 0, 1, 2, false));
+        d.addView(sSlider("Speed", "bgSpeed", st.bgSpeed(), 0.1, 3, 2, false));
+        d.addView(sBool("Animate", "animate", st.bgAnimate(), "off = still picture (less GPU)", false));
+
+        d.addView(section("Motion"));
+        d.addView(sBool("Animations", "motion", st.motion(), "tab transitions, button press / hover, popups", true));
+        d.addView(sSlider("Animation speed", "motionSpeed", st.motionSpeed(), 0.3, 3, 2, false));
+
+        d.addView(section("Sounds"));
+        d.addView(sBool("UI sounds", "sfx", st.sfx(), "clicks, tab switches, toggles, job done / failed", false));
+        d.addView(sChoice("Sound pack", "sfxPack", AppStyle.PACKS, AppStyle.PACK_LABELS, st.sfxPack(), false));
+        d.addView(sSlider("Volume", "sfxVol", st.sfxVol(), 0, 1, 2, false));
+        d.addView(sBool("Hover ticks", "sfxHover", st.sfxHover(), "soft tick when the pointer moves onto a button", false));
+        LinearLayout test = hbox();
+        for (String n : new String[]{"click", "tab", "on", "success", "error", "boot"}) {
+            TextView b = outlinedButton(n, v -> ui.postDelayed(() -> sfx.play(n), 90), false);
+            test.addView(b, lpm(0, -2, 1, 3));
+        }
+        d.addView(test);
+
+        d.addView(section("Cursor"));
+        d.addView(sChoice("Cursor", "cursor", AppStyle.CURSORS, AppStyle.CURSOR_LABELS, st.cursor(), false));
+        d.addView(sSlider("Cursor size", "cursorSize", st.cursorSize(), 8, 48, 0, false));
+        d.addView(sChoice("Cursor color", "cursorColor", AppStyle.CURSOR_COLORS, AppStyle.CURSOR_COLOR_LABELS, st.cursorColor(), false));
+        d.addView(sBool("Trail", "cursorTrail", st.cursorTrail(), "fading dots behind the cursor", false));
+        d.addView(sBool("Hide system pointer", "hidePointer", st.hidePointer(), "asks Android to hide its pointer (Horizon OS may still draw its own ray dot)", false));
+
+        d.addView(section("Boot screen"));
+        d.addView(sChoice("Boot animation", "boot", AppStyle.BOOTS, AppStyle.BOOT_LABELS, st.boot(), false));
+        d.addView(row("Preview", withIcon(button("Play boot screen", false, v -> { showBoot(true); ui.postDelayed(this::bootReady, 400); }, false), "play")));
+
+        d.addView(section("Share / reset"));
+        LinearLayout sr = hbox();
+        sr.addView(withIcon(button("Copy style code", true, v -> copyText("vrfrida style", "vrstyle:" + android.util.Base64.encodeToString(appLook.root.toString().getBytes(), android.util.Base64.NO_WRAP)), false), "upload"), lpm(0, -2, 1, 3));
+        sr.addView(withIcon(button("Paste style code", false, v -> pasteStyle(), false), "download"), lpm(0, -2, 1, 3));
+        sr.addView(dangerButton("Reset all", v -> {
+            JSONObject o = appLook.root;
+            for (String k : new String[]{"appTheme", "mode", "hue", "nav", "navLabels", "uiScale", "corners", "font", "appBg", "bgStrength", "bgSpeed", "animate",
+                    "motion", "motionSpeed", "sfx", "sfxVol", "sfxPack", "sfxHover", "cursor", "cursorSize", "cursorColor", "cursorTrail", "hidePointer", "boot"}) o.remove(k);
+            log("app style reset to defaults");
+            styleChanged(true);
+        }), lpm(0, -2, 0.8f, 3));
+        d.addView(sr);
+        return d;
+    }
+
+    void pasteStyle() {
+        try {
+            android.content.ClipboardManager cm = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            CharSequence t = cm.hasPrimaryClip() && cm.getPrimaryClip().getItemCount() > 0 ? cm.getPrimaryClip().getItemAt(0).coerceToText(this) : null;
+            String s = t == null ? "" : t.toString().trim();
+            if (!s.startsWith("vrstyle:")) { log("clipboard has no style code (it starts with vrstyle:)"); sfx.play("error"); return; }
+            JSONObject in = new JSONObject(new String(android.util.Base64.decode(s.substring(8), android.util.Base64.DEFAULT), "UTF-8"));
+            java.util.Iterator<String> it = in.keys();
+            int n = 0;
+            while (it.hasNext()) { String k = it.next(); if (k.equals("menu")) continue; appLook.root.put(k, in.get(k)); n++; }
+            log("style pasted (" + n + " settings)");
+            sfx.play("success");
+            styleChanged(true);
+        } catch (Exception e) { log("couldn't read that style code: " + e.getMessage()); sfx.play("error"); }
+    }
+
+    // ================================================================ Tools tab
+    Map<String, String> props;            // getprop values the Tools tab shows, null = not loaded yet
+    String toolOut = "", toolCmd = "";
+    String adbInfo = "", selinux = "?", storageInfo = "";
+
+    static final String[][] PERF = {
+            {"debug.oculus.refreshRate", "Refresh rate", "Default|72|80|90|120"},
+            {"debug.oculus.cpuLevel", "CPU level", "Default|0|1|2|3|4|5"},
+            {"debug.oculus.gpuLevel", "GPU level", "Default|0|1|2|3|4|5"},
+            {"debug.oculus.textureWidth", "Render resolution (per eye)", "Default|1024|1440|1680|1832|2016|2208|2448|2752|3072"},
+            {"debug.oculus.foveation.level", "Fixed foveation", "Default|0|1|2|3|4"},
+    };
+
+    void loadTools() {
+        toolsExec.execute(() -> {
+            Map<String, String> m = new java.util.HashMap<>();
+            StringBuilder q = new StringBuilder();
+            for (String[] p : PERF) q.append("echo \"").append(p[0]).append("=$(getprop ").append(p[0]).append(")\"\n");
+            q.append("echo \"adbport=$(getprop service.adb.tcp.port)\"\n");
+            q.append("echo \"ip=$(ip -4 -o addr show wlan0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)\"\n");
+            q.append("echo \"selinux=$(getenforce)\"\n");
+            Root.Result r = Root.sh(q.toString());
+            for (String l : r.out.split("\n")) { int i = l.indexOf('='); if (i > 0) m.put(l.substring(0, i).trim(), l.substring(i + 1).trim()); }
+            String port = m.getOrDefault("adbport", ""), ip = m.getOrDefault("ip", "");
+            String ai = port.isEmpty() || port.equals("-1") || port.equals("0") ? "off" : "on, " + (ip.isEmpty() ? "no wifi ip" : ip) + ":" + port;
+            Root.Result du = Root.sh("cd " + Root.q(Paths.ROOT.getPath()) + " && du -sh .sound_cache logs agents bridges plugins sounds 2>/dev/null");
+            ui.post(() -> {
+                props = m; adbInfo = ai; selinux = m.getOrDefault("selinux", "?");
+                storageInfo = du.out.replace("\t", "  ");
+                if (tab == TAB_TOOLS) rebuild();
+            });
+        });
+    }
+
+    void tool(String what, String script) { tool(what, script, true); }
+
+    /** run a root script from the Tools tab, show its output, reload the values */
+    void tool(String what, String script, boolean reload) {
+        if (!rootOk) { log(what + " needs root"); sfx.play("error"); return; }
+        log("── tools: " + what);
+        progress(-1);
+        toolsExec.execute(() -> {
+            Root.Result r = Root.sh(script);
+            String out = r.out.isEmpty() ? "(no output, exit " + r.code + ")" : r.out;
+            if (out.length() > 20000) out = out.substring(out.length() - 20000);
+            String fo = out;
+            ui.post(() -> {
+                progress(Float.NaN);
+                toolOut = "$ " + what + "\n" + fo;
+                sfx.play(r.ok() ? "success" : "error");
+                log(what + (r.ok() ? ": done" : ": failed (exit " + r.code + ")"));
+                if (reload) loadTools(); else if (tab == TAB_TOOLS) rebuild();
+            });
+        });
+    }
+
+    View toolsTab() {
+        LinearLayout d = vbox();
+        if (!rootOk) {
+            TextView w = text("The tools need root (Magisk). Without root there is nothing here to run.", 14, col("NotifWarn"));
+            w.setPadding(dp(4), dp(8), 0, dp(8));
+            d.addView(w);
+            return d;
+        }
+        if (props == null) { loadTools(); props = new java.util.HashMap<>(); }
+
+        d.addView(section("Performance"));
+        TextView ph = text("System properties the VR runtime reads when an app starts: relaunch the game after changing them. They reset on reboot.", 13, m3("onSurfaceVariant"));
+        ph.setPadding(dp(4), 0, 0, dp(4));
+        d.addView(ph);
+        for (String[] p : PERF) {
+            String[] opts = p[2].split("\\|");
+            String cur = props.getOrDefault(p[0], "");
+            int idx = 0;
+            for (int i = 1; i < opts.length; i++) if (opts[i].equals(cur)) idx = i;
+            String[] labels = opts.clone();
+            if (idx == 0 && !cur.isEmpty()) labels[0] = "Custom (" + cur + ")";
+            d.addView(row(p[1], combo(labels, idx, i -> {
+                String v = i == 0 ? "\"\"" : opts[i];
+                String cmd = "setprop " + p[0] + " " + v;
+                if (p[0].equals("debug.oculus.textureWidth")) cmd += "\nsetprop debug.oculus.textureHeight " + v;
+                tool(p[1] + " -> " + opts[i], cmd);
+            })));
+        }
+        LinearLayout pr = hbox();
+        pr.addView(button("Reset all to default", false, v -> {
+            StringBuilder s = new StringBuilder();
+            for (String[] p : PERF) s.append("setprop ").append(p[0]).append(" \"\"\n");
+            s.append("setprop debug.oculus.textureHeight \"\"\n");
+            tool("reset performance props", s.toString());
+        }, false), lpm(0, -2, 1, 3));
+        pr.addView(button("Reload values", false, v -> loadTools(), false), lpm(0, -2, 1, 3));
+        d.addView(pr);
+
+        d.addView(section("Device"));
+        LinearLayout adb = hbox();
+        adb.addView(button("Enable :5555", true, v -> tool("wifi adb on", "setprop service.adb.tcp.port 5555\nstop adbd\nstart adbd"), false), lpm(0, -2, 1, 3));
+        adb.addView(button("Disable", false, v -> tool("wifi adb off", "setprop service.adb.tcp.port -1\nstop adbd\nstart adbd"), false), lpm(0, -2, 1, 3));
+        d.addView(row("Wi-Fi ADB (" + adbInfo + ")", adb));
+        LinearLayout prox = hbox();
+        prox.addView(button("Stay awake", false, v -> tool("proximity sensor off", "am broadcast -a com.oculus.vrpowermanager.prox_close"), false), lpm(0, -2, 1, 3));
+        prox.addView(button("Normal", false, v -> tool("proximity sensor on", "am broadcast -a com.oculus.vrpowermanager.automation_disable"), false), lpm(0, -2, 1, 3));
+        d.addView(row("Proximity sensor", prox));
+        LinearLayout se = hbox();
+        se.addView(button("Permissive", false, v -> tool("selinux permissive", "setenforce 0\ngetenforce"), false), lpm(0, -2, 1, 3));
+        se.addView(button("Enforcing", false, v -> tool("selinux enforcing", "setenforce 1\ngetenforce"), false), lpm(0, -2, 1, 3));
+        d.addView(row("SELinux (" + selinux + ")", se));
+        d.addView(row("Screenshot", withIcon(button("Take screenshot", false, v -> {
+            String f = new File(Paths.ROOT, "captures/shot_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".png").getPath();
+            tool("screenshot", "mkdir -p " + Root.q(new File(f).getParent()) + "\nscreencap -p " + Root.q(f) + " && ls -la " + Root.q(f), false);
+        }, false), "download")));
+
+        if (sel != null) {
+            String pkg = sel.ai.packageName;
+            d.addView(section("Selected game: " + sel.label));
+            LinearLayout gr = hbox();
+            gr.addView(dangerButton("Force stop", v -> tool("force stop " + pkg, "am force-stop " + Root.q(pkg))), lpm(0, -2, 1, 3));
+            gr.addView(button("Clear cache", false, v -> tool("clear cache " + pkg, "rm -rf /data/data/" + pkg + "/cache/* /data/data/" + pkg + "/code_cache/* /sdcard/Android/data/" + pkg + "/cache/* 2>&1; echo cleared"), false), lpm(0, -2, 1, 3));
+            gr.addView(button("Process info", false, v -> tool("process info " + pkg,
+                    "p=$(pidof " + Root.q(pkg) + ")\nif [ -z \"$p\" ]; then echo 'not running'; exit 0; fi\necho \"pid $p\"\n"
+                            + "grep -E 'VmRSS|VmHWM|Threads' /proc/$p/status\necho \"uptime $(ps -o etime= -p $p)\"\n"
+                            + "echo \"libs: $(grep -c '\\.so' /proc/$p/maps) so mappings\"\ngrep -q frida /proc/$p/maps && echo 'frida: loaded' || echo 'frida: not loaded'", false), false), lpm(0, -2, 1, 3));
+            d.addView(gr);
+        }
+
+        d.addView(section("Storage (/sdcard/vrfrida)"));
+        if (!storageInfo.isEmpty()) {
+            TextView si = text(storageInfo, 13, m3("onSurfaceVariant"));
+            si.setTypeface(Typeface.MONOSPACE);
+            si.setPadding(dp(12), dp(4), 0, dp(4));
+            d.addView(si);
+        }
+        LinearLayout sc = hbox();
+        sc.addView(button("Clear sound cache", false, v -> tool("clear sound cache", "rm -rf " + Root.q(Paths.SOUND_CACHE.getPath()) + "/*; echo cleared (sounds convert again on the next push)"), false), lpm(0, -2, 1, 3));
+        sc.addView(button("Clear logs", false, v -> tool("clear logs", "rm -f " + Root.q(Paths.LOGS.getPath()) + "/*.log; echo cleared"), false), lpm(0, -2, 1, 3));
+        d.addView(sc);
+
+        d.addView(section("Root shell"));
+        LinearLayout sh = hbox();
+        EditText cmd = field("command (runs as root)", toolCmd, 2000);
+        cmd.setTypeface(Typeface.MONOSPACE);
+        cmd.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void afterTextChanged(Editable s) { toolCmd = s.toString(); }
+        });
+        sh.addView(cmd, lp(0, -2, 1));
+        LinearLayout.LayoutParams rp = lp(-2, -2, 0);
+        rp.setMargins(dp(8), 0, 0, 0);
+        sh.addView(withIcon(button("Run", true, v -> { if (!toolCmd.trim().isEmpty()) tool(toolCmd.trim(), toolCmd, false); }, false), "play"), rp);
+        d.addView(sh);
+        LinearLayout quick = hbox();
+        String[][] qs = {{"oculus props", "getprop | grep -i oculus"}, {"battery", "dumpsys battery"}, {"storage", "df -h /sdcard /data"}, {"top", "top -b -n 1 | head -25"}};
+        for (String[] q : qs) quick.addView(outlinedButton(q[0], v -> tool(q[1], q[1], false), false), lpm(0, -2, 1, 3));
+        LinearLayout.LayoutParams qp = lp(-1, -2, 0);
+        qp.setMargins(0, dp(6), 0, 0);
+        d.addView(quick, qp);
+        TextView out = terminal(d, "output", 12);
+        out.setText(toolOut.isEmpty() ? "run something above" : toolOut);
+        out.setTextIsSelectable(true);
         return d;
     }
 }
