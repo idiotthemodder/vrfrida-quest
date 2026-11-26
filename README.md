@@ -8,10 +8,10 @@
   <a href="https://github.com/idiotthemodder/vrfrida-quest/releases/latest"><img alt="release date" src="https://img.shields.io/github/release-date/idiotthemodder/vrfrida-quest?style=for-the-badge&label=released&color=06b6d4"></a>
   <a href="https://github.com/idiotthemodder/vrfrida-quest/commits/main"><img alt="last commit" src="https://img.shields.io/github/last-commit/idiotthemodder/vrfrida-quest?style=for-the-badge&color=10b981"></a>
   <br>
-  <img alt="Meta Quest" src="https://img.shields.io/badge/Meta%20Quest-2%20%C2%B7%203%20%C2%B7%20Pro-1c1e20?style=for-the-badge&logo=meta&logoColor=white">
-  <img alt="Android arm64" src="https://img.shields.io/badge/android-arm64--v8a-3ddc84?style=for-the-badge&logo=android&logoColor=white">
-  <img alt="frida 17.x" src="https://img.shields.io/badge/frida-17.x-ef6456?style=for-the-badge&logoColor=white">
-  <img alt="root optional" src="https://img.shields.io/badge/root-optional%20(magisk)-eab308?style=for-the-badge">
+  <img alt="Meta Quest" src="art/badges/quest.svg">
+  <img alt="Android arm64" src="art/badges/android.svg">
+  <img alt="frida 17.x" src="art/badges/frida.svg">
+  <img alt="root optional" src="art/badges/root.svg">
   <a href="https://github.com/idiotthemodder/vrfrida-quest"><img alt="repo size" src="https://img.shields.io/github/repo-size/idiotthemodder/vrfrida-quest?style=for-the-badge&color=ff7a1a"></a>
 </p>
 
